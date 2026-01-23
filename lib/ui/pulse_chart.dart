@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
+import '../themes/theme_extensions.dart';
 
 class PulseChart extends StatelessWidget {
   final List<double> values;
@@ -8,17 +9,37 @@ class PulseChart extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final themeExt = Theme.of(context).extension<AppThemeExtension>()!;
     final maxX = values.isEmpty ? 1.0 : values.length.toDouble();
 
+    // Auto-scale Y axis based on EMG values
+    double maxY = 5000; // Default max for EMG
+    double minY = 0;
+    double interval = 1000;
+
+    if (values.isNotEmpty) {
+      final maxValue = values.reduce((a, b) => a > b ? a : b);
+      final minValue = values.reduce((a, b) => a < b ? a : b);
+
+      // Add some padding
+      maxY = (maxValue * 1.2).ceilToDouble();
+      minY = (minValue * 0.8).floorToDouble();
+
+      // Calculate appropriate interval
+      interval = ((maxY - minY) / 5).ceilToDouble();
+      if (interval < 1) interval = 1;
+    }
+
     return SizedBox(
-      height: MediaQuery.of(context).size.height * 0.5, // 👈 половина экрана сверху
+      height:
+          MediaQuery.of(context).size.height * 0.5, // 👈 половина экрана сверху
       child: LineChart(
         LineChartData(
           backgroundColor: Colors.transparent,
 
-          // 👇 Ограничение графика по Y
-          minY: 0,
-          maxY: 360,
+          // 👇 Auto-scaled Y axis for EMG values
+          minY: minY,
+          maxY: maxY,
 
           minX: 0,
           maxX: maxX,
@@ -27,10 +48,10 @@ class PulseChart extends StatelessWidget {
             show: true,
             drawHorizontalLine: true,
             drawVerticalLine: false,
-            horizontalInterval: 60, // линии на 0, 60, 120, 180, 240, 300, 360
+            horizontalInterval: interval,
             getDrawingHorizontalLine: (value) {
               return FlLine(
-                color: Colors.white24,
+                color: themeExt.textSecondaryColor.withOpacity(0.2),
                 strokeWidth: 1,
               );
             },
@@ -43,12 +64,15 @@ class PulseChart extends StatelessWidget {
             leftTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                reservedSize: 40,
-                interval: 60,
+                reservedSize: 50,
+                interval: interval,
                 getTitlesWidget: (value, _) {
                   return Text(
                     value.toInt().toString(),
-                    style: const TextStyle(color: Colors.white),
+                    style: TextStyle(
+                      color: themeExt.textSecondaryColor,
+                      fontSize: 10,
+                    ),
                   );
                 },
               ),
@@ -63,7 +87,7 @@ class PulseChart extends StatelessWidget {
                 getTitlesWidget: (value, _) {
                   return Text(
                     value.toInt().toString(),
-                    style: const TextStyle(color: Colors.white70),
+                    style: TextStyle(color: themeExt.textSecondaryColor),
                   );
                 },
               ),
@@ -78,18 +102,21 @@ class PulseChart extends StatelessWidget {
             LineChartBarData(
               spots: [
                 for (int i = 0; i < values.length; i++)
-                  FlSpot(i.toDouble(), values[i].clamp(0, 360).toDouble())
+                  FlSpot(i.toDouble(), values[i])
               ],
               isCurved: false,
-              color: Colors.white,
+              color: themeExt.primaryColor,
               barWidth: 2,
-              dotData: FlDotData(show: false),
+              dotData: const FlDotData(show: false),
             ),
           ],
 
           borderData: FlBorderData(
             show: true,
-            border: Border.all(color: Colors.white24, width: 1),
+            border: Border.all(
+              color: themeExt.textSecondaryColor.withOpacity(0.2),
+              width: 1,
+            ),
           ),
         ),
       ),

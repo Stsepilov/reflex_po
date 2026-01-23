@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import '../../blocs/ble/ble_bloc.dart';
-import '../../blocs/ble/ble_event.dart';
-import '../../blocs/ble/ble_state.dart';
+import '../blocs/ble/ble_bloc.dart';
+import '../blocs/ble/ble_event.dart';
+import '../blocs/ble/ble_state.dart';
 import 'pulse_chart.dart';
 
 class PulseScreen extends StatelessWidget {
@@ -13,7 +13,7 @@ class PulseScreen extends StatelessWidget {
     return BlocProvider(
       create: (_) => BleBloc()..add(BleStartScan()),
       child: Scaffold(
-        backgroundColor: Colors.black,
+        backgroundColor: Theme.of(context).scaffoldBackgroundColor,
         appBar: AppBar(
           title: const Text("Pulse Monitor"),
           actions: [
