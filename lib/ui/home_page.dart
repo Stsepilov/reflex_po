@@ -1,216 +1,115 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:reflex_po/ui/pulse_chart.dart';
-
 import '../themes/theme_extensions.dart';
-
 import '../blocs/ble/ble_bloc.dart';
 import '../blocs/ble/ble_event.dart';
 import '../blocs/ble/ble_state.dart';
-import '../widgets/angle_indicator.dart';
+import '../widgets/no_etalon_dialog.dart';
+import '../widgets/angle_range_dialog.dart';
+import 'exercise_screen.dart';
+import 'record_etalon_screen.dart';
 
-class HomePage extends StatelessWidget {
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
-  Widget _buildComparisonInfo(BleState state, AppThemeExtension themeExt) {
-    final seconds = (state.elapsedTimeMs / 1000).toStringAsFixed(1);
-    final currentAngle = state.values.isNotEmpty ? state.values.last : 0.0;
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: [
-          _buildInfoCard(
-            'Время',
-            '${seconds}s',
-            themeExt,
-          ),
-          _buildInfoCard(
-            'Текущий',
-            '${currentAngle.toStringAsFixed(1)}°',
-            themeExt,
-          ),
-          _buildInfoCard(
-            'Эталон',
-            '${state.currentReferenceAngle.toStringAsFixed(1)}°',
-            themeExt,
-          ),
-          _buildInfoCard(
-            'Разница',
-            '${state.angleDifference.toStringAsFixed(1)}°',
-            themeExt,
-            isError: state.angleDifference > 10,
-          ),
-        ],
-      ),
-    );
+class _HomePageState extends State<HomePage> {
+  BleBloc? _bleBloc;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Сохраняем ссылку на BleBloc
+    _bleBloc ??= context.read<BleBloc>();
   }
 
-  Widget _buildInfoCard(
-    String label,
-    String value,
-    AppThemeExtension themeExt, {
-    bool isError = false,
+  @override
+  void initState() {
+    super.initState();
+    // Останавливаем поток данных при входе на главный экран
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<BleBloc>().add(BleStopDataStream());
+    });
+  }
+
+  Widget _buildNavigationCard({
+    required BuildContext context,
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required Color color,
+    required VoidCallback onTap,
+    bool isDisabled = false,
   }) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-      decoration: BoxDecoration(
-        color: isError
-            ? themeExt.accentColor.withOpacity(0.1)
-            : themeExt.primaryColor.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            label,
-            style: TextStyle(
-              color: themeExt.textSecondaryColor,
-              fontSize: 9,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-          const SizedBox(height: 1),
-          Text(
-            value,
-            style: TextStyle(
-              color: isError ? themeExt.accentColor : themeExt.primaryColor,
-              fontSize: 13,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+    final themeExt = Theme.of(context).extension<AppThemeExtension>()!;
 
-  Widget _buildReferenceButton(
-    BuildContext context,
-    BleState state,
-    AppThemeExtension themeExt,
-  ) {
-    final isRecording = state.isRecordingReference;
-    final hasReference = state.referenceSegments.isNotEmpty;
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 40),
-      child: Column(
-        children: [
-          // Кнопка записи
-          ElevatedButton(
-            onPressed: state.status == BleConnectionStatus.connected
-                ? () {
-                    if (isRecording) {
-                      context.read<BleBloc>().add(BleStopReferenceRecording());
-                    } else {
-                      context.read<BleBloc>().add(BleStartReferenceRecording());
-                    }
-                  }
-                : null,
-            style: ElevatedButton.styleFrom(
-              backgroundColor:
-                  isRecording ? themeExt.accentColor : themeExt.primaryColor,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
+    return GestureDetector(
+      onTap: onTap,
+      child: Opacity(
+        opacity: isDisabled ? 0.6 : 1.0,
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.9),
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: color.withOpacity(isDisabled ? 0.1 : 0.3),
+                blurRadius: 15,
+                offset: const Offset(0, 8),
               ),
-              elevation: 3,
-              disabledBackgroundColor:
-                  themeExt.textSecondaryColor.withOpacity(0.3),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  isRecording ? Icons.stop_circle : Icons.fiber_manual_record,
-                  size: 20,
-                ),
-                const SizedBox(width: 10),
-                Text(
-                  isRecording ? 'Остановить запись' : 'Записать эталон',
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
+            ],
           ),
-
-          const SizedBox(height: 8),
-
-          // Индикатор состояния
-          if (isRecording && !state.isComparing)
+        child: Row(
+          children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color: themeExt.accentColor.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(6),
+                color: color.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(15),
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
+              child: Icon(
+                icon,
+                size: 40,
+                color: color,
+              ),
+            ),
+            const SizedBox(width: 20),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation<Color>(
-                        themeExt.accentColor,
-                      ),
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: themeExt.textPrimaryColor,
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  const SizedBox(height: 4),
                   Text(
-                    'Идёт запись эталона...',
+                    subtitle,
                     style: TextStyle(
-                      color: themeExt.textPrimaryColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500,
+                      fontSize: 14,
+                      color: themeExt.textSecondaryColor,
                     ),
                   ),
                 ],
               ),
-            )
-          else if (hasReference && !state.isComparing)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: themeExt.primaryColor.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.check_circle,
-                    color: themeExt.primaryColor,
-                    size: 14,
-                  ),
-                  const SizedBox(width: 6),
-                  Text(
-                    'Эталон загружен (${state.referenceSegments.length} сегментов)',
-                    style: TextStyle(
-                      color: themeExt.textPrimaryColor,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ],
-              ),
-            )
-          else
-            Text(
-              'Нет сохранённого эталона',
-              style: TextStyle(
-                color: themeExt.textSecondaryColor,
-                fontSize: 12,
-              ),
             ),
-        ],
+            Icon(
+              Icons.arrow_forward_ios,
+              color: color,
+              size: 24,
+            ),
+          ],
+        ),
+        ),
       ),
     );
   }
@@ -227,63 +126,65 @@ class HomePage extends StatelessWidget {
         appBar: AppBar(
           backgroundColor: Colors.transparent,
           elevation: 0,
-          leading: BlocBuilder<BleBloc, BleState>(
-            builder: (context, state) {
-              final hasReference = state.referenceSegments.isNotEmpty;
-              final isComparing = state.isComparing;
-
-              if (!hasReference) {
-                return const SizedBox.shrink();
-              }
-
-              return Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    icon: Icon(
-                      isComparing ? Icons.pause : Icons.play_arrow,
-                      color: themeExt.primaryColor,
-                    ),
-                    onPressed: state.status == BleConnectionStatus.connected
-                        ? () {
-                            if (isComparing) {
-                              context.read<BleBloc>().add(BlePauseComparison());
-                            } else {
-                              context.read<BleBloc>().add(BleStartComparison());
-                            }
-                          }
-                        : null,
-                  ),
-                ],
-              );
-            },
-          ),
           title: Text(
             "Reflex",
-            style: TextStyle(color: themeExt.textPrimaryColor),
+            style: TextStyle(
+              color: themeExt.textPrimaryColor,
+              fontSize: 28,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           centerTitle: true,
           actions: [
+            // Settings button for angle borders
+            BlocBuilder<BleBloc, BleState>(
+              builder: (context, state) {
+                return IconButton(
+                  icon: Icon(Icons.settings, color: themeExt.primaryColor),
+                  onPressed: () async {
+                    final result = await showAngleRangeDialog(
+                      context,
+                      initialMinAngle: state.minAngleBorder,
+                      initialMaxAngle: state.maxAngleBorder,
+                    );
+                    if (result != null) {
+                      context.read<BleBloc>().add(
+                        BleUpdateAngleBorders(
+                          minAngle: result['minAngle']!,
+                          maxAngle: result['maxAngle']!,
+                        ),
+                      );
+                    }
+                  },
+                );
+              },
+            ),
+            // Bluetooth button
             BlocBuilder<BleBloc, BleState>(
               builder: (context, state) {
                 IconData icon;
+                Color iconColor;
                 switch (state.status) {
                   case BleConnectionStatus.connected:
                     icon = Icons.bluetooth_connected;
+                    iconColor = themeExt.primaryColor;
                     break;
                   case BleConnectionStatus.scanning:
                     icon = Icons.bluetooth_searching;
+                    iconColor = themeExt.primaryColor.withOpacity(0.6);
                     break;
                   case BleConnectionStatus.connecting:
                     icon = Icons.bluetooth;
+                    iconColor = themeExt.primaryColor.withOpacity(0.6);
                     break;
                   case BleConnectionStatus.disconnected:
                   default:
                     icon = Icons.bluetooth_disabled;
+                    iconColor = themeExt.textSecondaryColor;
                 }
 
                 return IconButton(
-                  icon: Icon(icon, color: themeExt.primaryColor),
+                  icon: Icon(icon, color: iconColor),
                   onPressed: () {
                     context.read<BleBloc>().add(BleRestartScan());
                   },
@@ -292,41 +193,151 @@ class HomePage extends StatelessWidget {
             ),
           ],
         ),
-        body: BlocBuilder<BleBloc, BleState>(
-          builder: (context, state) {
-            final angleValues = state.values;
-            final emgValues = state.emgValues;
+        body: SafeArea(
+          child: Column(
+            children: [
+              const SizedBox(height: 40),
 
-            // Среднее за пакет
-            double angle = angleValues.isNotEmpty ? angleValues.last : 0.0;
-
-            return Column(
-              children: [
-                PulseChart(values: emgValues),
-
-                const SizedBox(height: 5),
-
-                // Индикатор углов
-                AngleIndicator(
-                  currentAngle: angle,
-                  referenceAngle: state.currentReferenceAngle,
-                  showReference: state.isComparing,
+              // Welcome text
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Добро пожаловать!',
+                      style: TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.bold,
+                        color: themeExt.textPrimaryColor,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Выберите действие',
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: themeExt.textSecondaryColor,
+                      ),
+                    ),
+                  ],
                 ),
+              ),
 
-                const SizedBox(height: 5),
+              const SizedBox(height: 40),
 
-                // Информация о сравнении
-                if (state.isComparing) _buildComparisonInfo(state, themeExt),
+              // Exercise card (with etalon check)
+              BlocBuilder<BleBloc, BleState>(
+                builder: (context, state) {
+                  final hasEtalon = state.referenceSegments.isNotEmpty;
+                  
+                  return _buildNavigationCard(
+                    context: context,
+                    title: 'Начать упражнение',
+                    subtitle: hasEtalon 
+                        ? 'Тренировка с эталоном' 
+                        : 'Требуется запись эталона',
+                    icon: Icons.fitness_center,
+                    color: themeExt.primaryColor,
+                    isDisabled: !hasEtalon,
+                    onTap: () async {
+                      if (!hasEtalon) {
+                        // Show dialog if no etalon
+                        await showNoEtalonDialog(context);
+                      } else {
+                        // Navigate to exercise screen
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (newContext) => BlocProvider.value(
+                              value: context.read<BleBloc>(),
+                              child: const ExerciseScreen(),
+                            ),
+                          ),
+                        );
+                      }
+                    },
+                  );
+                },
+              ),
 
-                if (state.isComparing) const SizedBox(height: 5),
+              // Record etalon card
+              _buildNavigationCard(
+                context: context,
+                title: 'Записать эталон',
+                subtitle: 'Создать новый эталон',
+                icon: Icons.fiber_manual_record,
+                color: themeExt.accentColor,
+                onTap: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (newContext) => BlocProvider.value(
+                        value: context.read<BleBloc>(),
+                        child: const RecordEtalonScreen(),
+                      ),
+                    ),
+                  );
+                },
+              ),
 
-                // Кнопка записи эталона
-                _buildReferenceButton(context, state, themeExt),
+              const Spacer(),
 
-                const SizedBox(height: 8),
-              ],
-            );
-          },
+              // Connection status
+              BlocBuilder<BleBloc, BleState>(
+                builder: (context, state) {
+                  String statusText;
+                  Color statusColor;
+
+                  switch (state.status) {
+                    case BleConnectionStatus.connected:
+                      statusText = 'Подключено';
+                      statusColor = themeExt.primaryColor;
+                      break;
+                    case BleConnectionStatus.scanning:
+                      statusText = 'Поиск устройства...';
+                      statusColor = themeExt.textSecondaryColor;
+                      break;
+                    case BleConnectionStatus.connecting:
+                      statusText = 'Подключение...';
+                      statusColor = themeExt.textSecondaryColor;
+                      break;
+                    case BleConnectionStatus.disconnected:
+                    default:
+                      statusText = 'Не подключено';
+                      statusColor = themeExt.textSecondaryColor;
+                  }
+
+                  return Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 12),
+                    margin: const EdgeInsets.only(bottom: 20),
+                    decoration: BoxDecoration(
+                      color: statusColor.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.circle,
+                          size: 12,
+                          color: statusColor,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          statusText,
+                          style: TextStyle(
+                            color: statusColor,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
         ),
       ),
     );

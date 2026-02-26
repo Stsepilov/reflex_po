@@ -6,20 +6,42 @@ import 'dart:math';
 class TestDataGenerator {
   Timer? _timer;
   final Random _random = Random();
+  int _simulatedTimeMs = 0;
+  double _currentAngle = 140.0;
+  bool _movingDown = true;
+  int _packetIndexInSegment = 0;
+  double _segmentStartAngle = 140.0;
+  double _segmentEndAngle = 135.0;
+
+  static const double _maxAngle = 140.0;
+  static const double _minAngle = 0.0;
+  static const double _angleStepPerTick = 5.0;
+  static const int _tickMs = 50;
+  static const int _packetsPerSegment = 3;
   
   final Function({
     required List<double> angleValues,
     required List<double> emgValues,
   }) onNewData;
+  final void Function(String packet)? onRawPacket;
 
-  TestDataGenerator({required this.onNewData});
+  TestDataGenerator({
+    required this.onNewData,
+    this.onRawPacket,
+  });
 
   /// Начать генерацию тестовых данных
   void start() {
     _timer?.cancel();
+    _simulatedTimeMs = 0;
+    _currentAngle = _maxAngle;
+    _movingDown = true;
+    _packetIndexInSegment = 0;
+    _segmentStartAngle = _maxAngle;
+    _segmentEndAngle = _maxAngle - _angleStepPerTick;
     
-    // Генерируем данные каждые 200ms (как в реальном BLE сервисе)
-    _timer = Timer.periodic(const Duration(milliseconds: 200), (_) {
+    // Генерируем данные каждые 50ms
+    _timer = Timer.periodic(const Duration(milliseconds: _tickMs), (_) {
       _generateTestPacket();
     });
     
@@ -35,48 +57,80 @@ class TestDataGenerator {
 
   /// Генерировать один пакет тестовых данных
   void _generateTestPacket() {
-    // Генерируем 2 значения угла (как в реальном устройстве)
-    final angleValues = [
-      _generateAngle(),
-      _generateAngle(),
-    ];
+    _updateInterpolatedAngle();
 
-    // Генерируем 5 значений EMG (как в примере)
+    // 2 угла, как у BLE: второй с небольшим шумом
+    final angle1 = _currentAngle;
+    final angle2 = (_currentAngle + (_random.nextDouble() * 2 - 1))
+        .clamp(_minAngle, _maxAngle)
+        .toDouble();
+    final angleValues = [angle1, angle2];
+
+    // 3 EMG-канала по условию
     final emgValues = [
       _generateEMG(),
       _generateEMG(),
       _generateEMG(),
-      _generateEMG(),
-      _generateEMG(),
     ];
 
+    final packet = _buildBleLikePacket(
+      angleValues: angleValues,
+      emgValues: emgValues,
+      timeMs: _simulatedTimeMs,
+    );
+    onRawPacket?.call(packet);
+
     onNewData(angleValues: angleValues, emgValues: emgValues);
+    _simulatedTimeMs += _tickMs;
+    _advanceSegmentCursor();
   }
 
-  /// Генерировать случайное значение угла (0-180°)
-  double _generateAngle() {
-    // Симулируем плавное изменение угла
-    final baseAngle = (DateTime.now().millisecondsSinceEpoch / 100) % 180;
-    final noise = _random.nextDouble() * 5 - 2.5; // ±2.5° шум
-    return (baseAngle + noise).clamp(0, 180);
+  void _updateInterpolatedAngle() {
+    final fraction = _packetIndexInSegment / (_packetsPerSegment - 1);
+    _currentAngle =
+        _segmentStartAngle + (_segmentEndAngle - _segmentStartAngle) * fraction;
   }
 
-  /// Генерировать случайное значение EMG (500-50000)
+  void _advanceSegmentCursor() {
+    _packetIndexInSegment++;
+    if (_packetIndexInSegment < _packetsPerSegment) return;
+
+    _packetIndexInSegment = 0;
+    _segmentStartAngle = _segmentEndAngle;
+    _updateDirectionByBounds();
+
+    final nextEnd = _movingDown
+        ? _segmentStartAngle - _angleStepPerTick
+        : _segmentStartAngle + _angleStepPerTick;
+    _segmentEndAngle = nextEnd.clamp(_minAngle, _maxAngle).toDouble();
+  }
+
+  void _updateDirectionByBounds() {
+    if (_segmentStartAngle <= _minAngle) {
+      _movingDown = false;
+    } else if (_segmentStartAngle >= _maxAngle) {
+      _movingDown = true;
+    }
+  }
+
+  String _buildBleLikePacket({
+    required List<double> angleValues,
+    required List<double> emgValues,
+    required int timeMs,
+  }) {
+    final angles = angleValues.map((a) => a.toStringAsFixed(1)).join(' ');
+    final emg = emgValues.map((e) => e.round().toString()).join(' ');
+    return "Angle: $angles EMG: $emg Time: $timeMs";
+  }
+
+  /// Генерировать значение EMG (более активно в середине амплитуды)
   double _generateEMG() {
-    // Базовый уровень EMG
-    final baseLevel = 1000.0;
-    
-    // Добавляем периодический сигнал (симуляция мышечной активности)
-    final time = DateTime.now().millisecondsSinceEpoch / 1000;
-    final periodicSignal = sin(time * 2 * pi / 3) * 5000; // 3-секундный цикл
-    
-    // Добавляем случайный шум
-    final noise = _random.nextDouble() * 10000;
-    
-    // Случайные всплески активности (10% вероятность)
-    final burst = _random.nextDouble() < 0.1 ? _random.nextDouble() * 30000 : 0;
-    
-    return (baseLevel + periodicSignal + noise + burst).clamp(100, 50000);
+    final normalized = ((_currentAngle - _minAngle) / (_maxAngle - _minAngle))
+        .clamp(0.0, 1.0);
+    final activation = sin(normalized * pi); // Пик в середине
+    final base = 2000.0 + activation * 6000.0;
+    final noise = (_random.nextDouble() * 1200) - 600;
+    return (base + noise).clamp(300, 20000);
   }
 
   /// Освободить ресурсы

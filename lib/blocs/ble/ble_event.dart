@@ -30,7 +30,18 @@ class BleNewDataReceived extends BleEvent {
   List<Object?> get props => [angleValues, emgValues];
 }
 
-class BleStartReferenceRecording extends BleEvent {}
+class BleStartReferenceRecording extends BleEvent {
+  final int minAngle;
+  final int maxAngle;
+
+  BleStartReferenceRecording({
+    required this.minAngle,
+    required this.maxAngle,
+  });
+
+  @override
+  List<Object?> get props => [minAngle, maxAngle];
+}
 
 class BleStopReferenceRecording extends BleEvent {}
 
@@ -39,3 +50,20 @@ class BleStartComparison extends BleEvent {}
 class BlePauseComparison extends BleEvent {}
 
 class BleResetComparison extends BleEvent {}
+
+class BleStartDataStream extends BleEvent {}
+
+class BleStopDataStream extends BleEvent {}
+
+class BleUpdateAngleBorders extends BleEvent {
+  final int minAngle;
+  final int maxAngle;
+
+  BleUpdateAngleBorders({
+    required this.minAngle,
+    required this.maxAngle,
+  });
+
+  @override
+  List<Object?> get props => [minAngle, maxAngle];
+}

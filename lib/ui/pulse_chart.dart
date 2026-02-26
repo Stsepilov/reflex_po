@@ -4,13 +4,23 @@ import '../themes/theme_extensions.dart';
 
 class PulseChart extends StatelessWidget {
   final List<double> values;
+  final int xStart;
 
-  const PulseChart({super.key, required this.values});
+  const PulseChart({
+    super.key,
+    required this.values,
+    this.xStart = 0,
+  });
 
   @override
   Widget build(BuildContext context) {
     final themeExt = Theme.of(context).extension<AppThemeExtension>()!;
-    final maxX = values.isEmpty ? 1.0 : values.length.toDouble();
+    
+    // Sliding window over fixed-size buffer with global X offset.
+    final minX = xStart.toDouble();
+    final maxX = values.isEmpty
+        ? minX + 1
+        : (xStart + values.length - 1).toDouble();
 
     // Auto-scale Y axis based on EMG values
     double maxY = 5000; // Default max for EMG
@@ -41,7 +51,7 @@ class PulseChart extends StatelessWidget {
           minY: minY,
           maxY: maxY,
 
-          minX: 0,
+          minX: minX,
           maxX: maxX,
 
           gridData: FlGridData(
@@ -82,13 +92,20 @@ class PulseChart extends StatelessWidget {
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                interval: 50, // каждые 50 точек подпись
+                interval: 100, // каждые 100 точек подпись
                 reservedSize: 24,
                 getTitlesWidget: (value, _) {
-                  return Text(
-                    value.toInt().toString(),
-                    style: TextStyle(color: themeExt.textSecondaryColor),
-                  );
+                  // Показываем только если значение в видимом диапазоне
+                  if (value >= minX && value <= maxX) {
+                    return Text(
+                      value.toInt().toString(),
+                      style: TextStyle(
+                        color: themeExt.textSecondaryColor,
+                        fontSize: 10,
+                      ),
+                    );
+                  }
+                  return const SizedBox.shrink();
                 },
               ),
             ),
@@ -102,7 +119,7 @@ class PulseChart extends StatelessWidget {
             LineChartBarData(
               spots: [
                 for (int i = 0; i < values.length; i++)
-                  FlSpot(i.toDouble(), values[i])
+                  FlSpot((xStart + i).toDouble(), values[i])
               ],
               isCurved: false,
               color: themeExt.primaryColor,
