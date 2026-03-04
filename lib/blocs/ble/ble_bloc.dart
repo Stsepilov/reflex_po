@@ -471,13 +471,20 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Map<String, List<double>>? _buildTimePhaseSeries(List<FinalSegment> table) {
     if (table.isEmpty) return null;
 
-    final nodes = _buildAngleTimeNodes(table);
-    if (nodes == null) return null;
-    final theta = nodes['theta']!;
-    final emg = nodes['emg']!;
-    final cumulativeTime = nodes['time']!;
+    final theta = <double>[];
+    final emg = <double>[];
+    final cumulativeTime = <double>[];
 
-    final totalTime = cumulativeTime.last;
+    double runningTime = 0.0;
+    for (final row in table) {
+      final dt = max(0, row.timeMs);
+      runningTime += dt;
+      theta.add(row.firstAvgAngle);
+      emg.add(row.avgEmg);
+      cumulativeTime.add(runningTime);
+    }
+
+    final totalTime = runningTime;
     if (totalTime <= 0) return null;
 
     final phi = cumulativeTime.map((t) => t / totalTime).toList();
@@ -495,17 +502,18 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Map<String, List<double>>? _buildAnglePhaseSeries(List<FinalSegment> table) {
     if (table.isEmpty) return null;
 
-    final nodes = _buildAngleTimeNodes(table);
-    if (nodes == null) return null;
-    final theta = nodes['theta']!;
-    final cumulativeTime = nodes['time']!;
+    final cumulativeAngle = <double>[];
+    final cumulativeTime = <double>[];
+    double runningAngle = 0.0;
+    double runningTime = 0.0;
 
-    final cumulativeAngle = <double>[0.0];
-    var runningAngle = 0.0;
-    for (int i = 1; i < theta.length; i++) {
-      final dTheta = (theta[i] - theta[i - 1]).abs();
+    for (final row in table) {
+      final dTheta = row.absoluteAngle.abs();
+      final dt = max(0, row.timeMs);
       runningAngle += dTheta;
+      runningTime += dt;
       cumulativeAngle.add(runningAngle);
+      cumulativeTime.add(runningTime);
     }
 
     if (runningAngle <= 0) return null;
@@ -515,30 +523,6 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     return {
       'phi': strict['x']!,
       'time': strict['y']!,
-    };
-  }
-
-  Map<String, List<double>>? _buildAngleTimeNodes(List<FinalSegment> table) {
-    if (table.isEmpty) return null;
-
-    final theta = <double>[table.first.firstAvgAngle];
-    final emg = <double>[table.first.avgEmg];
-    final cumulativeTime = <double>[0.0];
-
-    var runningTime = 0.0;
-    for (final row in table) {
-      final dt = max(0, row.timeMs).toDouble();
-      runningTime += dt;
-      theta.add(row.lastAvgAngle);
-      emg.add(row.avgEmg);
-      cumulativeTime.add(runningTime);
-    }
-
-    if (theta.length < 2 || cumulativeTime.length < 2) return null;
-    return {
-      'theta': theta,
-      'emg': emg,
-      'time': cumulativeTime,
     };
   }
 
@@ -607,10 +591,11 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     if (cumulativeTime.isEmpty) return [];
 
     final result = List<int>.filled(cumulativeTime.length, 1);
-    result[0] = 0; // phi=0 must correspond to the initial angle at t=0.
-    for (int i = 1; i < cumulativeTime.length; i++) {
-      final dt = (cumulativeTime[i] - cumulativeTime[i - 1]).round();
+    var prev = 0.0;
+    for (int i = 0; i < cumulativeTime.length; i++) {
+      final dt = (cumulativeTime[i] - prev).round();
       result[i] = dt <= 0 ? 1 : dt;
+      prev = cumulativeTime[i];
     }
     return result;
   }
