@@ -247,11 +247,18 @@ class _RecordEtalonScreenState extends State<RecordEtalonScreen> {
 
                 const SizedBox(height: 5),
 
-                // Индикатор углов
-                AngleIndicator(
-                  currentAngle: angle,
-                  referenceAngle: state.currentReferenceAngle,
-                  showReference: false,
+                // Индикатор углов с плавной интерполяцией между тиками данных
+                TweenAnimationBuilder<double>(
+                  tween: Tween<double>(end: angle),
+                  duration: const Duration(milliseconds: 10),
+                  curve: Curves.linear,
+                  builder: (context, animatedAngle, child) {
+                    return AngleIndicator(
+                      currentAngle: animatedAngle,
+                      referenceAngle: state.currentReferenceAngle,
+                      showReference: false,
+                    );
+                  },
                 ),
 
                 const SizedBox(height: 20),

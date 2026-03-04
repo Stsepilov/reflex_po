@@ -5,6 +5,8 @@ import 'temp_segment_data.dart';
 class FinalSegment {
   final int index; // Shift number (0, 1, 2, ...)
   final double firstAvgAngle; // First avg angle from temp table
+  final double lastAvgAngle; // Last avg angle from temp table
+  final double signedAngle; // Signed angle delta (last - first)
   final double absoluteAngle; // Absolute difference between last and first angle
   final double avgEmg; // Average EMG across the whole temp table
   final double absoluteEmg; // Difference between last and first EMG
@@ -15,6 +17,8 @@ class FinalSegment {
   FinalSegment({
     required this.index,
     required this.firstAvgAngle,
+    required this.lastAvgAngle,
+    required this.signedAngle,
     required this.absoluteAngle,
     required this.avgEmg,
     required this.absoluteEmg,
@@ -26,6 +30,8 @@ class FinalSegment {
   Map<String, dynamic> toJson() => {
         'index': index,
         'firstAvgAngle': firstAvgAngle,
+        'lastAvgAngle': lastAvgAngle,
+        'signedAngle': signedAngle,
         'absoluteAngle': absoluteAngle,
         'avgEmg': avgEmg,
         'absoluteEmg': absoluteEmg,
@@ -34,16 +40,31 @@ class FinalSegment {
         'timeMs': timeMs,
       };
 
-  factory FinalSegment.fromJson(Map<String, dynamic> json) => FinalSegment(
-        index: json['index'] as int,
-        firstAvgAngle: (json['firstAvgAngle'] as num).toDouble(),
-        absoluteAngle: (json['absoluteAngle'] as num).toDouble(),
-        avgEmg: (json['avgEmg'] as num).toDouble(),
-        absoluteEmg: (json['absoluteEmg'] as num).toDouble(),
-        deltaAngle: (json['deltaAngle'] as num).toDouble(),
-        deltaEmg: (json['deltaEmg'] as num).toDouble(),
-        timeMs: json['timeMs'] as int,
-      );
+  factory FinalSegment.fromJson(Map<String, dynamic> json) {
+    final firstAvgAngle = (json['firstAvgAngle'] as num).toDouble();
+    final absoluteAngle = (json['absoluteAngle'] as num).toDouble();
+    final signedAngleRaw = json['signedAngle'];
+    final signedAngle = signedAngleRaw is num
+        ? signedAngleRaw.toDouble()
+        : absoluteAngle;
+    final lastAvgAngleRaw = json['lastAvgAngle'];
+    final lastAvgAngle = lastAvgAngleRaw is num
+        ? lastAvgAngleRaw.toDouble()
+        : firstAvgAngle + signedAngle;
+
+    return FinalSegment(
+      index: json['index'] as int,
+      firstAvgAngle: firstAvgAngle,
+      lastAvgAngle: lastAvgAngle,
+      signedAngle: signedAngle,
+      absoluteAngle: absoluteAngle,
+      avgEmg: (json['avgEmg'] as num).toDouble(),
+      absoluteEmg: (json['absoluteEmg'] as num).toDouble(),
+      deltaAngle: (json['deltaAngle'] as num).toDouble(),
+      deltaEmg: (json['deltaEmg'] as num).toDouble(),
+      timeMs: json['timeMs'] as int,
+    );
+  }
 
   /// Calculate shift-row values from temporary packet table
   static FinalSegment fromTempData(
@@ -58,7 +79,8 @@ class FinalSegment {
     final lastRow = tempData.last;
 
     // Calculate absolute values (difference between last and first)
-    final absoluteAngle = (lastRow.avgAngle - firstRow.avgAngle).abs();
+    final signedAngle = lastRow.avgAngle - firstRow.avgAngle;
+    final absoluteAngle = signedAngle.abs();
     final absoluteEmg = lastRow.avgEmg - firstRow.avgEmg;
 
     // Calculate delta values (max - min) / 2
@@ -82,6 +104,8 @@ class FinalSegment {
     return FinalSegment(
       index: shiftIndex,
       firstAvgAngle: firstRow.avgAngle,
+      lastAvgAngle: lastRow.avgAngle,
+      signedAngle: signedAngle,
       absoluteAngle: absoluteAngle,
       avgEmg: avgEmg,
       absoluteEmg: absoluteEmg,

@@ -4,11 +4,13 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:ui';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:reflex_po/services/app_logger.dart';
 import 'package:reflex_po/services/permission_handler.dart';
 
 typedef OnNewDataCallback = void Function({
   required List<double> angleValues,
   required List<double> emgValues,
+  required List<double> timeValues,
 });
 
 /// 🔴 ЭТОТ ФАЙЛ ЗАКОММЕНТИРОВАН В BLE_BLOC ДЛЯ ТЕСТИРОВАНИЯ
@@ -29,6 +31,8 @@ class BleService {
   StreamSubscription? _scanSubscription;
   StreamSubscription<List<int>>? _valueSubscription;
   Timer? _queueProcessorTimer;
+  bool _isProcessingQueueNow = false;
+  bool _isQueueDrainScheduled = false;
   bool _isStreamingData = false;
   BluetoothCharacteristic? _dataCharacteristic;
 
@@ -36,6 +40,10 @@ class BleService {
   final Queue<Map<String, List<double>>> _dataQueue = Queue();
   final int _maxQueueSize = 100; // Prevent memory overflow
   int _droppedDataCount = 0;
+  int _enqueuedPackets = 0;
+  int _processedPackets = 0;
+  int _maxObservedQueueSize = 0;
+  DateTime? _queueStatsWindowStart;
 
   BleService({
     required this.onNewData,
@@ -45,20 +53,20 @@ class BleService {
 
   /// 🔍 Старт сканирования
   Future<void> startScan() async {
-    print("Начинаем сканирование...");
+    appTalker.info("BLE: начинаем сканирование");
 
     final ok = await checkBlePermissions();
     if (!ok) {
-      print("Нет разрешений на BLE");
+      appTalker.warning("BLE: нет разрешений на BLE");
       return;
     }
 
     // Подписка на результаты
     _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
-      print("Получено ${results.length} результатов сканирования");
+      appTalker.debug("BLE: получено ${results.length} результатов сканирования");
       for (ScanResult result in results) {
         if (result.device.platformName == targetDeviceName) {
-          print("Найден девайс: ${result.device.platformName}");
+          appTalker.info("BLE: найден девайс ${result.device.platformName}");
           onConnected?.call();
           stopScan();
           _targetDevice = result.device;
@@ -67,14 +75,14 @@ class BleService {
         }
       }
     }, onError: (error) {
-      print("Ошибка сканирования: $error");
+      appTalker.error("BLE: ошибка сканирования", error);
     });
 
     FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
   }
 
   void stopScan() {
-    print("Останавливаем сканирование...");
+    appTalker.info("BLE: остановка сканирования");
     FlutterBluePlus.stopScan();
     _scanSubscription?.cancel();
     _scanSubscription = null;
@@ -85,11 +93,11 @@ class BleService {
 
     try {
       await _targetDevice!.connect(autoConnect: false);
-      print("Подключено к ${_targetDevice!.platformName}");
+      appTalker.info("BLE: подключено к ${_targetDevice!.platformName}");
       onConnected?.call();
       await _discoverServices();
     } catch (e) {
-      print("Ошибка подключения: $e");
+      appTalker.error("BLE: ошибка подключения", e);
     }
   }
 
@@ -106,19 +114,19 @@ class BleService {
               in service.characteristics) {
             if (characteristic.uuid.toString().toLowerCase() ==
                 characteristicUUID) {
-              print("Подписываемся на notify");
+              appTalker.info("BLE: характеристика найдена, готово к notify");
 
               // Сохраняем характеристику для чтения данных
               _dataCharacteristic = characteristic;
               // Не запускаем автоматически - будет запущено при входе на нужный экран
-              print("Характеристика найдена и сохранена");
+              appTalker.info("BLE: характеристика сохранена");
               return;
             }
           }
         }
       }
     } catch (e) {
-      print("Ошибка сервисов: $e");
+      appTalker.error("BLE: ошибка discovery сервисов", e);
     }
   }
 
@@ -137,26 +145,26 @@ class BleService {
           final str = utf8.decode(value, allowMalformed: true).trim();
           if (str.isEmpty) return;
 
-          print("Получено notify: $str");
+          appTalker.debug("BLE notify: $str");
           _handleIncomingData(str);
         },
         onError: (error) {
-          print("Ошибка notify характеристики: $error");
+          appTalker.error("BLE: ошибка notify характеристики", error);
         },
       );
     } catch (e) {
-      print("Ошибка запуска notify: $e");
+      appTalker.error("BLE: ошибка запуска notify", e);
     }
   }
 
   /// ⏸️ Приостановить поток данных
   void pauseDataStream() {
-    print("Приостановка потока данных");
+    appTalker.info("BLE: приостановка потока данных");
     _isStreamingData = false;
     _valueSubscription?.cancel();
     _valueSubscription = null;
     _dataCharacteristic?.setNotifyValue(false).catchError((error) {
-      print("Ошибка отключения notify: $error");
+      appTalker.error("BLE: ошибка отключения notify", error);
       return false;
     });
     _stopQueueProcessor();
@@ -164,13 +172,15 @@ class BleService {
 
   /// ▶️ Возобновить поток данных
   Future<void> resumeDataStream() async {
-    print("Возобновление потока данных");
+    appTalker.info("BLE: возобновление потока данных");
     if (_dataCharacteristic != null) {
       _droppedDataCount = 0; // Reset counter
+      _resetQueueStats();
       await _startDataStream(_dataCharacteristic!);
       _startQueueProcessor(); // Start queue processor
     } else {
-      print("Характеристика не найдена, невозможно возобновить поток");
+      appTalker.warning(
+          "BLE: характеристика не найдена, невозможно возобновить поток");
     }
   }
 
@@ -185,48 +195,108 @@ class BleService {
     if (_dataQueue.length < _maxQueueSize) {
       _dataQueue.add(parsedData);
     } else {
-      // Queue full - drop oldest data and add new
-      print("⚠️ Queue full (${_maxQueueSize}), dropping oldest data");
+      appTalker.warning(
+          "BLE queue overflow (${_maxQueueSize}), dropping oldest packet");
       _droppedDataCount++;
       _dataQueue.removeFirst();
       _dataQueue.add(parsedData);
     }
+    _enqueuedPackets++;
+    if (_dataQueue.length > _maxObservedQueueSize) {
+      _maxObservedQueueSize = _dataQueue.length;
+    }
+
+    // Try to deliver fresh data immediately, without waiting for timer tick.
+    _scheduleImmediateQueueDrain();
   }
 
   /// 🔄 Process queued data at controlled rate
   void _startQueueProcessor() {
     _queueProcessorTimer?.cancel();
 
-    // Process queue every 50ms (20 Hz processing rate)
+    // Process queue every 20ms to reduce end-to-end visual lag.
     _queueProcessorTimer =
-        Timer.periodic(const Duration(milliseconds: 50), (timer) {
+        Timer.periodic(const Duration(milliseconds: 20), (timer) {
       if (!_isStreamingData) {
         timer.cancel();
         return;
       }
 
-      // Adaptive draining: process more items when backlog grows.
-      final itemsToProcess = min(_dataQueue.length, _calculateDrainBatchSize());
-
-      for (int i = 0; i < itemsToProcess; i++) {
-        if (_dataQueue.isNotEmpty) {
-          final data = _dataQueue.removeFirst();
-          onNewData(
-            angleValues: data['angle'] ?? [],
-            emgValues: data['emg'] ?? [],
-          );
-        }
-      }
+      _processQueueBatch();
+      _logQueueStatsIfNeeded();
 
       // Monitor queue health
       if (_dataQueue.length > 50) {
-        print("⚠️ Queue backlog: ${_dataQueue.length} items");
+        appTalker.warning("BLE queue backlog: ${_dataQueue.length} items");
       }
 
       if (_droppedDataCount > 0 && _droppedDataCount % 10 == 0) {
-        print("⚠️ Total dropped data packets: $_droppedDataCount");
+        appTalker.warning("BLE dropped data packets: $_droppedDataCount");
       }
     });
+  }
+
+  void _scheduleImmediateQueueDrain() {
+    if (_isQueueDrainScheduled) return;
+    _isQueueDrainScheduled = true;
+    scheduleMicrotask(() {
+      _isQueueDrainScheduled = false;
+      if (_isStreamingData) {
+        _processQueueBatch();
+      }
+    });
+  }
+
+  void _processQueueBatch() {
+    if (_isProcessingQueueNow || _dataQueue.isEmpty) return;
+    _isProcessingQueueNow = true;
+    try {
+      // Adaptive draining: process more items when backlog grows.
+      final itemsToProcess = min(_dataQueue.length, _calculateDrainBatchSize());
+      for (int i = 0; i < itemsToProcess; i++) {
+        if (_dataQueue.isEmpty) break;
+        final data = _dataQueue.removeFirst();
+        onNewData(
+          angleValues: data['angle'] ?? [],
+          emgValues: data['emg'] ?? [],
+          timeValues: data['time'] ?? [],
+        );
+        _processedPackets++;
+      }
+    } finally {
+      _isProcessingQueueNow = false;
+    }
+  }
+
+  void _resetQueueStats() {
+    _enqueuedPackets = 0;
+    _processedPackets = 0;
+    _maxObservedQueueSize = 0;
+    _queueStatsWindowStart = DateTime.now();
+  }
+
+  void _logQueueStatsIfNeeded() {
+    _queueStatsWindowStart ??= DateTime.now();
+    final now = DateTime.now();
+    final elapsedMs = now.difference(_queueStatsWindowStart!).inMilliseconds;
+    if (elapsedMs < 1000) return;
+
+    final elapsedSec = elapsedMs / 1000.0;
+    final inRate = _enqueuedPackets / elapsedSec;
+    final outRate = _processedPackets / elapsedSec;
+    final level = _dataQueue.length;
+    final fillPercent = (level / _maxQueueSize * 100).clamp(0, 100).round();
+
+    appTalker.info(
+      "BLE queue stats: size=$level/${_maxQueueSize} (${fillPercent}%), "
+      "max=$_maxObservedQueueSize, in=${inRate.toStringAsFixed(1)} pkt/s, "
+      "out=${outRate.toStringAsFixed(1)} pkt/s, dropped=$_droppedDataCount",
+    );
+
+    _enqueuedPackets = 0;
+    _processedPackets = 0;
+    _maxObservedQueueSize = level;
+    _queueStatsWindowStart = now;
   }
 
   int _calculateDrainBatchSize() {
@@ -242,6 +312,7 @@ class BleService {
   void _stopQueueProcessor() {
     _queueProcessorTimer?.cancel();
     _queueProcessorTimer = null;
+    _queueStatsWindowStart = null;
     _dataQueue.clear();
   }
 
@@ -252,6 +323,7 @@ class BleService {
     try {
       List<double> angleValues = [];
       List<double> emgValues = [];
+      List<double> timeValues = [];
 
       // Ищем позиции ключевых слов
       final angleIndex = data.indexOf('Angle:');
@@ -280,16 +352,23 @@ class BleService {
         final emgString = data.substring(emgStart, emgEnd).trim();
         emgValues = _parseStringToDoubleList(emgString);
       }
-      print(emgValues.map((e) => e * 10).toList());
+      if (timeIndex != -1) {
+        final timeTokenLength = timeMatch?.group(0)?.length ?? 4;
+        final timeStart = timeIndex + timeTokenLength;
+        final timeString = data.substring(timeStart).trim();
+        timeValues = _parseStringToDoubleList(timeString);
+      }
       return {
         'angle': angleValues,
-        'emg': emgValues.map((e) => e * 10).toList(),
+        'emg': emgValues,
+        'time': timeValues,
       };
     } catch (e) {
-      print("Ошибка парсинга данных: $e");
+      appTalker.error("BLE: ошибка парсинга входящих данных", e);
       return {
         'angle': [],
         'emg': [],
+        'time': [],
       };
     }
   }

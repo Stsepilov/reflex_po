@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'ble_event.dart';
 import 'ble_state.dart';
 import '../../services/ble_service.dart';
+import '../../services/app_logger.dart';
 import '../../services/pchip.dart';
 // import '../../services/test_data_generator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -31,14 +33,23 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   int _tempDataIndex = 0; // Index for temp table rows (packet table)
   int _shiftDataIndex = 0; // Index for shift table rows
 
-  // Buffers for averaging
-  final List<double> _angleBuffer = [];
-  final List<double> _emgBuffer = [];
+  // In one BLE packet MCU may send multiple sequential samples.
+  static const int _inPacketSampleSpacingMs = 20;
+  int _lastRecordedSampleTimeMs = -1;
   // UI/state buffers to avoid data loss between throttled emits
   final List<double> _anglesForUi = [];
   final List<double> _emgForUi = [];
+  final Queue<double> _anglePlaybackQueue = Queue<double>();
+  Timer? _uiTickTimer;
+  static const int _uiTickMs = _inPacketSampleSpacingMs;
   int _emgSampleCount = 0;
   double _latestAngle = 0.0;
+  double? _emaAngle;
+  // Adaptive EMA: lower alpha for calm motion, higher alpha for sharp motion.
+  static const double _angleEmaAlphaMin = 0.15;
+  static const double _angleEmaAlphaMax = 0.85;
+  static const double _emaSlowDeltaDeg = 0.5;
+  static const double _emaFastDeltaDeg = 8.0;
 
   // Repetition tracking (max -> min -> max)
   int _completedReps = 0;
@@ -78,17 +89,21 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Timer? _comparisonTimer;
 
   // Performance monitoring
-  int _dataProcessCounter = 0;
   int _droppedFrames = 0;
   DateTime _lastProcessTime = DateTime.now();
 
   BleBloc() : super(BleState.initial()) {
     _bleService = BleService(
       targetDeviceName: "MyESP32",
-      onNewData: ({required angleValues, required emgValues}) {
+      onNewData: ({
+        required angleValues,
+        required emgValues,
+        required timeValues,
+      }) {
         add(BleNewDataReceived(
           angleValues: angleValues,
           emgValues: emgValues,
+          timeValues: timeValues,
         ));
       },
       onConnected: () => add(BleConnected()),
@@ -128,6 +143,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     on<BleStartDataStream>(_onStartDataStream);
     on<BleStopDataStream>(_onStopDataStream);
     on<BleUpdateAngleBorders>(_onUpdateAngleBorders);
+    on<BleUiTick>(_onUiTick);
   }
 
   Future<void> _onStartScan(BleStartScan event, Emitter<BleState> emit) async {
@@ -144,8 +160,12 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     // _testDataGenerator.stop();
     _anglesForUi.clear();
     _emgForUi.clear();
+    _anglePlaybackQueue.clear();
+    _uiTickTimer?.cancel();
+    _uiTickTimer = null;
     _emgSampleCount = 0;
     _latestAngle = 0.0;
+    _emaAngle = null;
 
     emit(
       state.copyWith(
@@ -172,20 +192,24 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     if (timeSinceLastProcess > 100) {
       _droppedFrames++;
       if (_droppedFrames % 10 == 0) {
-        print(
-            "⚠️ Slow processing detected: ${timeSinceLastProcess}ms (dropped frames: $_droppedFrames)");
+        appTalker.warning(
+            "BLE bloc slow processing: ${timeSinceLastProcess}ms (dropped: $_droppedFrames)");
       }
     }
     _lastProcessTime = now;
-    _dataProcessCounter++;
 
-    // Keep accumulating in dedicated buffers even when we skip emit.
-    _anglesForUi.addAll(event.angleValues);
-    if (_anglesForUi.length > 500) {
-      _anglesForUi.removeRange(0, _anglesForUi.length - 500);
-    }
+    // Queue packet angles and render them sequentially between BLE packets.
     if (event.angleValues.isNotEmpty) {
-      _latestAngle = event.angleValues.last;
+      for (final rawAngle in event.angleValues) {
+        if (_emaAngle == null) {
+          _emaAngle = rawAngle;
+        } else {
+          final alpha = _adaptiveEmaAlpha(rawAngle);
+          _emaAngle = alpha * rawAngle + (1 - alpha) * _emaAngle!;
+        }
+        _anglePlaybackQueue.add(_emaAngle!);
+      }
+      _ensureUiTickTimerRunning();
     }
 
     if (event.emgValues.isNotEmpty) {
@@ -199,28 +223,61 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       }
     }
 
-    // Throttle UI updates: only emit state every 2nd update (reduces from 20Hz to 10Hz)
-    // This reduces UI rebuilds while keeping data processing at full speed
-    final shouldEmit = _dataProcessCounter % 2 == 0;
-
-    if (shouldEmit) {
-      final emgStartX = _emgSampleCount - _emgForUi.length;
-      emit(state.copyWith(
-        values: List<double>.from(_anglesForUi),
-        emgValues: List<double>.from(_emgForUi),
-        emgStartX: emgStartX < 0 ? 0 : emgStartX,
-      ));
-    }
-
     // Process recording data (always process, regardless of UI throttling)
     if (_isRecordingReference) {
-      _processReferenceData(event.angleValues, event.emgValues);
+      _processReferenceData(
+        event.angleValues,
+        event.emgValues,
+        event.timeValues,
+      );
     }
 
-    // Comparison updates (always process)
-    if (_isComparing) {
-      _updateComparison(emit);
+    // Comparison state is updated by dedicated 20 Hz timer.
+  }
+
+  Future<void> _onUiTick(BleUiTick event, Emitter<BleState> emit) async {
+    if (_anglePlaybackQueue.isEmpty) return;
+
+    final samplesToRender = _anglePlaybackQueue.length >= 12
+        ? 4
+        : (_anglePlaybackQueue.length >= 6 ? 2 : 1);
+
+    for (int i = 0; i < samplesToRender; i++) {
+      if (_anglePlaybackQueue.isEmpty) break;
+      _latestAngle = _anglePlaybackQueue.removeFirst();
+      _anglesForUi.add(_latestAngle);
     }
+    if (_anglesForUi.length > 500) {
+      _anglesForUi.removeRange(0, _anglesForUi.length - 500);
+    }
+
+    final emgStartX = _emgSampleCount - _emgForUi.length;
+    emit(state.copyWith(
+      values: List<double>.from(_anglesForUi),
+      emgValues: List<double>.from(_emgForUi),
+      emgStartX: emgStartX < 0 ? 0 : emgStartX,
+    ));
+  }
+
+  void _ensureUiTickTimerRunning() {
+    _uiTickTimer ??=
+        Timer.periodic(const Duration(milliseconds: _uiTickMs), (_) {
+      if (!isClosed && _anglePlaybackQueue.isNotEmpty) {
+        add(BleUiTick());
+      }
+    });
+  }
+
+  double _adaptiveEmaAlpha(double rawAngle) {
+    if (_emaAngle == null) return _angleEmaAlphaMax;
+
+    final delta = (rawAngle - _emaAngle!).abs();
+    if (delta <= _emaSlowDeltaDeg) return _angleEmaAlphaMin;
+    if (delta >= _emaFastDeltaDeg) return _angleEmaAlphaMax;
+
+    final t =
+        (delta - _emaSlowDeltaDeg) / (_emaFastDeltaDeg - _emaSlowDeltaDeg);
+    return _angleEmaAlphaMin + (_angleEmaAlphaMax - _angleEmaAlphaMin) * t;
   }
 
   Future<void> _onStartReference(
@@ -243,11 +300,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _currentTempTable.clear();
     _currentRepTable.clear();
     _repetitionTables.clear();
-    _angleBuffer.clear();
-    _emgBuffer.clear();
+    _lastRecordedSampleTimeMs = -1;
 
-    print(
-        "Начало записи эталона: $_targetReps повторений ($_maxAngle° → $_minAngle° → $_maxAngle°)");
+    appTalker.info(
+        "Эталон: старт записи ($_targetReps повторений, $_maxAngle° → $_minAngle° → $_maxAngle°)");
     emit(state.copyWith(isRecordingReference: true));
   }
 
@@ -261,14 +317,11 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     // finalized yet due to manual stop timing.
     _tryFinalizeCurrentShift();
 
-    print("========================================");
-    print("НАЧАЛО ОБРАБОТКИ ЭТАЛОНА");
-    print("Всего повторов: ${_repetitionTables.length}");
-    print("Всего сдвигов: ${_finalSegments.length}");
-    print("========================================");
+    appTalker.info(
+        "Эталон: начало обработки, повторы=${_repetitionTables.length}, сдвиги=${_finalSegments.length}");
 
     if (_repetitionTables.isEmpty) {
-      print("Нет данных повторов для обработки");
+      appTalker.warning("Эталон: нет данных повторов для обработки");
       emit(state.copyWith(isRecordingReference: false));
       return;
     }
@@ -281,16 +334,15 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       // Fallback to old averaging if there is not enough valid data.
       _averageRepetitionTablesIntoReference(repTables);
     }
-    print("Усреднено в ${_referenceSegments.length} референсных сегментов");
+    appTalker.info(
+        "Эталон: усреднено в ${_referenceSegments.length} референсных сегментов");
 
     // Save to SharedPreferences
     await _saveRepetitionTablesToStorage();
     await _savePhaseProfileToStorage();
     await _saveReferenceToStorage();
 
-    print("========================================");
-    print("ЭТАЛОН УСПЕШНО СОЗДАН");
-    print("========================================");
+    appTalker.critical("Эталон успешно создан");
 
     // Update state
     emit(
@@ -374,12 +426,14 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         emgTrials.add(emgPchip.resample(phiGrid));
         timeTrials.add(timePchip.resample(phiGrid));
       } catch (e) {
-        print("Пропуск таблицы при фазовой интерполяции: $e");
+        appTalker
+            .warning("Эталон: пропуск таблицы при фазовой интерполяции: $e");
       }
     }
 
     if (thetaTrials.isEmpty || emgTrials.isEmpty || timeTrials.isEmpty) {
-      print("Недостаточно валидных таблиц для фазовой нормализации");
+      appTalker.warning(
+          "Эталон: недостаточно валидных таблиц для фазовой нормализации");
       return false;
     }
 
@@ -404,8 +458,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _phaseEmg = emgMedian;
     _phaseTime = timeMedian;
 
-    print(
-        "Фазовая нормализация готова: trials=${thetaTrials.length}, points=$_phaseGridPoints");
+    appTalker.info(
+        "Эталон: фазовая нормализация готова (trials=${thetaTrials.length}, points=$_phaseGridPoints)");
     _printFinalReferenceArrays(
       theta: _phaseTheta,
       emg: _phaseEmg,
@@ -417,20 +471,13 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Map<String, List<double>>? _buildTimePhaseSeries(List<FinalSegment> table) {
     if (table.isEmpty) return null;
 
-    final theta = <double>[];
-    final emg = <double>[];
-    final cumulativeTime = <double>[];
+    final nodes = _buildAngleTimeNodes(table);
+    if (nodes == null) return null;
+    final theta = nodes['theta']!;
+    final emg = nodes['emg']!;
+    final cumulativeTime = nodes['time']!;
 
-    double runningTime = 0.0;
-    for (final row in table) {
-      final dt = max(0, row.timeMs);
-      runningTime += dt;
-      theta.add(row.firstAvgAngle);
-      emg.add(row.avgEmg);
-      cumulativeTime.add(runningTime);
-    }
-
-    final totalTime = runningTime;
+    final totalTime = cumulativeTime.last;
     if (totalTime <= 0) return null;
 
     final phi = cumulativeTime.map((t) => t / totalTime).toList();
@@ -448,18 +495,17 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Map<String, List<double>>? _buildAnglePhaseSeries(List<FinalSegment> table) {
     if (table.isEmpty) return null;
 
-    final cumulativeAngle = <double>[];
-    final cumulativeTime = <double>[];
-    double runningAngle = 0.0;
-    double runningTime = 0.0;
+    final nodes = _buildAngleTimeNodes(table);
+    if (nodes == null) return null;
+    final theta = nodes['theta']!;
+    final cumulativeTime = nodes['time']!;
 
-    for (final row in table) {
-      final dTheta = row.absoluteAngle.abs();
-      final dt = max(0, row.timeMs);
+    final cumulativeAngle = <double>[0.0];
+    var runningAngle = 0.0;
+    for (int i = 1; i < theta.length; i++) {
+      final dTheta = (theta[i] - theta[i - 1]).abs();
       runningAngle += dTheta;
-      runningTime += dt;
       cumulativeAngle.add(runningAngle);
-      cumulativeTime.add(runningTime);
     }
 
     if (runningAngle <= 0) return null;
@@ -469,6 +515,30 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     return {
       'phi': strict['x']!,
       'time': strict['y']!,
+    };
+  }
+
+  Map<String, List<double>>? _buildAngleTimeNodes(List<FinalSegment> table) {
+    if (table.isEmpty) return null;
+
+    final theta = <double>[table.first.firstAvgAngle];
+    final emg = <double>[table.first.avgEmg];
+    final cumulativeTime = <double>[0.0];
+
+    var runningTime = 0.0;
+    for (final row in table) {
+      final dt = max(0, row.timeMs).toDouble();
+      runningTime += dt;
+      theta.add(row.lastAvgAngle);
+      emg.add(row.avgEmg);
+      cumulativeTime.add(runningTime);
+    }
+
+    if (theta.length < 2 || cumulativeTime.length < 2) return null;
+    return {
+      'theta': theta,
+      'emg': emg,
+      'time': cumulativeTime,
     };
   }
 
@@ -537,11 +607,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     if (cumulativeTime.isEmpty) return [];
 
     final result = List<int>.filled(cumulativeTime.length, 1);
-    var prev = 0.0;
-    for (int i = 0; i < cumulativeTime.length; i++) {
-      final dt = (cumulativeTime[i] - prev).round();
+    result[0] = 0; // phi=0 must correspond to the initial angle at t=0.
+    for (int i = 1; i < cumulativeTime.length; i++) {
+      final dt = (cumulativeTime[i] - cumulativeTime[i - 1]).round();
       result[i] = dt <= 0 ? 1 : dt;
-      prev = cumulativeTime[i];
     }
     return result;
   }
@@ -558,35 +627,75 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   }
 
   void _processReferenceData(
-      List<double> newAngles, List<double> newEmgValues) {
+    List<double> newAngles,
+    List<double> newEmgValues,
+    List<double> newTimeValues,
+  ) {
     if (!_isRecordingReference || _recordingStartTime == null) return;
+    if (newAngles.isEmpty || newEmgValues.isEmpty) return;
 
-    // Add new data to buffers
-    _angleBuffer.addAll(newAngles);
-    _emgBuffer.addAll(newEmgValues);
-
-    // Calculate averages
-    if (_angleBuffer.isEmpty || _emgBuffer.isEmpty) return;
-
-    final avgAngle = _angleBuffer.reduce((a, b) => a + b) / _angleBuffer.length;
-    final avgEmg = _emgBuffer.reduce((a, b) => a + b) / _emgBuffer.length;
-    final currentTime =
+    final packetTimeMs =
         DateTime.now().difference(_recordingStartTime!).inMilliseconds;
+    final sampleCount = max(newAngles.length, newEmgValues.length);
 
-    // Add packet row to temporary table (table #1)
-    _currentTempTable.add(TempSegmentData(
-      index: _tempDataIndex++,
-      avgAngle: avgAngle,
-      avgEmg: avgEmg,
-      timeMs: currentTime,
-    ));
+    for (int i = 0; i < sampleCount; i++) {
+      final angle = _valueAtOrLast(newAngles, i);
+      final emg = _valueAtOrLast(newEmgValues, i);
 
-    // Clear buffers for next iteration
-    _angleBuffer.clear();
-    _emgBuffer.clear();
+      // Prefer MCU timestamps from packet. Fallback to local approximation.
+      var sampleTimeMs = _resolveSampleTimeMs(
+        packetTimeMs: packetTimeMs,
+        timeValuesFromMcu: newTimeValues,
+        sampleIndex: i,
+        sampleCount: sampleCount,
+      );
+      if (sampleTimeMs <= _lastRecordedSampleTimeMs) {
+        sampleTimeMs = _lastRecordedSampleTimeMs + 1;
+      }
+      _lastRecordedSampleTimeMs = sampleTimeMs;
 
-    _tryFinalizeCurrentShift();
-    _detectExtremaAndCountRepetitions(avgAngle);
+      _currentTempTable.add(TempSegmentData(
+        index: _tempDataIndex++,
+        avgAngle: angle,
+        avgEmg: emg,
+        timeMs: sampleTimeMs,
+      ));
+
+      _tryFinalizeCurrentShift();
+      _detectExtremaAndCountRepetitions(angle);
+    }
+  }
+
+  double _valueAtOrLast(List<double> values, int index) {
+    if (index < values.length) return values[index];
+    return values.last;
+  }
+
+  int _resolveSampleTimeMs({
+    required int packetTimeMs,
+    required List<double> timeValuesFromMcu,
+    required int sampleIndex,
+    required int sampleCount,
+  }) {
+    if (timeValuesFromMcu.isNotEmpty) {
+      // MCU time is used as packet anchor; inside one packet we keep fixed
+      // spacing between sequential samples.
+      final anchorTimeMs = _valueAtOrLast(
+        timeValuesFromMcu,
+        sampleCount - 1,
+      ).round();
+      if (anchorTimeMs >= 0) {
+        final offsetFromNewest =
+            (sampleCount - 1 - sampleIndex) * _inPacketSampleSpacingMs;
+        final estimatedFromAnchor = anchorTimeMs - offsetFromNewest;
+        return estimatedFromAnchor < 0 ? 0 : estimatedFromAnchor;
+      }
+    }
+
+    final offsetFromNewest =
+        (sampleCount - 1 - sampleIndex) * _inPacketSampleSpacingMs;
+    final estimated = packetTimeMs - offsetFromNewest;
+    return estimated < 0 ? 0 : estimated;
   }
 
   void _tryFinalizeCurrentShift() {
@@ -599,15 +708,49 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     // Keep collecting while shift is under 5°.
     if (shiftAbs < _shiftAngleThreshold) return;
 
+    // Boundary sample (that reaches 5° threshold) is included in finalized
+    // segment and also carried over as the first sample of the next segment.
+    final carryToNextSegment = _currentTempTable.last;
+    final finalizedRows = List<TempSegmentData>.from(_currentTempTable);
+    if (finalizedRows.length < 2) return;
+
     final shiftRow =
-        FinalSegment.fromTempData(_shiftDataIndex++, _currentTempTable);
+        FinalSegment.fromTempData(_shiftDataIndex++, finalizedRows);
     _finalSegments.add(shiftRow);
     _currentRepTable.add(shiftRow);
+    _printCurrentTempTableBeforeFinalize(finalizedRows, carryToNextSegment);
 
-    print(
+    appTalker.info(
         "Сдвиг #${shiftRow.index}: start=${shiftRow.firstAvgAngle.toStringAsFixed(1)}°, abs=${shiftRow.absoluteAngle.toStringAsFixed(1)}°, t=${shiftRow.timeMs}ms");
 
-    _currentTempTable.clear();
+    _currentTempTable
+      ..clear()
+      ..add(carryToNextSegment);
+  }
+
+  void _printCurrentTempTableBeforeFinalize(
+    List<TempSegmentData> rows,
+    TempSegmentData carryToNextSegment,
+  ) {
+    print("----- TEMP TIME TABLE (before 5° segment finalize) -----");
+    if (rows.isEmpty) {
+      print("Пусто");
+      print("---------------------------------------------------------");
+      return;
+    }
+
+    final firstTime = rows.first.timeMs;
+    int prevTime = firstTime;
+    for (final row in rows) {
+      final dtFromStart = row.timeMs - firstTime;
+      final dtFromPrev = row.timeMs - prevTime;
+      print(
+          "idx=${row.index.toString().padLeft(3)} | angle=${row.avgAngle.toStringAsFixed(2).padLeft(7)} | emg=${row.avgEmg.toStringAsFixed(2).padLeft(8)} | t=${row.timeMs.toString().padLeft(5)}ms | dt0=${dtFromStart.toString().padLeft(4)}ms | dt=${dtFromPrev.toString().padLeft(3)}ms");
+      prevTime = row.timeMs;
+    }
+    print(
+        "carry -> idx=${carryToNextSegment.index.toString().padLeft(3)} | angle=${carryToNextSegment.avgAngle.toStringAsFixed(2).padLeft(7)} | emg=${carryToNextSegment.avgEmg.toStringAsFixed(2).padLeft(8)} | t=${carryToNextSegment.timeMs.toString().padLeft(5)}ms");
+    print("---------------------------------------------------------");
   }
 
   void _detectExtremaAndCountRepetitions(double currentAvgAngle) {
@@ -674,7 +817,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   }
 
   void _onLocalMaximum(double angle) {
-    print("Локальный максимум: ${angle.toStringAsFixed(1)}°");
+    appTalker.info("Локальный максимум: ${angle.toStringAsFixed(1)}°");
 
     // Full repetition is counted only after a valid minimum.
     if (!_sawLocalMinInCurrentRep) return;
@@ -688,7 +831,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
 
       _repetitionTables.add(List<FinalSegment>.from(_currentRepTable));
       final repNumber = _repetitionTables.length;
-      print(
+      appTalker.info(
           "Максимум #$repNumber подтверждён. Повтор #$repNumber сохранён (${_currentRepTable.length} строк)");
       _printRepetitionTable(repNumber, _currentRepTable);
       _currentRepTable.clear();
@@ -702,7 +845,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _sawLocalMinInCurrentRep = false;
 
     if (_completedReps >= _targetReps) {
-      print("Достигнуто $_targetReps повторений, завершение записи");
+      appTalker
+          .critical("Достигнуто $_targetReps повторений, завершение записи");
       _isRecordingReference = false;
       add(BleStopReferenceRecording());
     }
@@ -720,7 +864,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   }
 
   void _onLocalMinimum(double angle) {
-    print("Локальный минимум: ${angle.toStringAsFixed(1)}°");
+    appTalker.info("Локальный минимум: ${angle.toStringAsFixed(1)}°");
     if (angle <= _minAngle + _extremaTolerance) {
       _sawLocalMinInCurrentRep = true;
     }
@@ -749,7 +893,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     final encoded = jsonEncode(jsonList);
     await prefs.setString(_referenceTableKey, encoded);
 
-    print(
+    appTalker.info(
         "Эталонная таблица сохранена: ${_referenceSegments.length} сегментов");
   }
 
@@ -762,7 +906,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         .toList();
 
     await prefs.setString(_repetitionTablesKey, jsonEncode(tablesJson));
-    print("Сохранено таблиц повторов: ${limitedTables.length}");
+    appTalker.info("Сохранено таблиц повторов: ${limitedTables.length}");
   }
 
   Future<void> _savePhaseProfileToStorage() async {
@@ -781,7 +925,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       'time': _phaseTime,
     };
     await prefs.setString(_phaseProfileKey, jsonEncode(phaseJson));
-    print("Фазовый эталон сохранён: ${_phasePhi.length} точек");
+    appTalker.info("Фазовый эталон сохранён: ${_phasePhi.length} точек");
   }
 
   Future<void> printReference() async {
@@ -810,10 +954,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _printSavedPhaseProfile(prefs);
 
     if (raw == null) {
-      print("========================================");
-      print("ETALON STATUS: NOT FOUND");
-      print("Reference table not found — running with empty.");
-      print("========================================");
+      appTalker
+          .warning("ETALON STATUS: NOT FOUND. Running with empty reference.");
       emit(state.copyWith(
         minAngleBorder: minAngle,
         maxAngleBorder: maxAngle,
@@ -826,11 +968,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       _referenceSegments =
           decoded.map((e) => ReferenceSegment.fromJson(e)).toList();
 
-      print("========================================");
-      print("ETALON DATA LOADED ON APP START");
-      print("========================================");
-      print("Total segments: ${_referenceSegments.length}");
-      print("");
+      appTalker.info(
+          "ETALON DATA LOADED ON APP START. Total segments: ${_referenceSegments.length}");
 
       if (_referenceSegments.isNotEmpty) {
         // Calculate angle range
@@ -855,7 +994,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         }
       }
 
-      print("========================================");
+      appTalker.info("ETALON DATA LOAD COMPLETED");
 
       // ОБНОВЛЯЕМ STATE
       emit(
@@ -866,28 +1005,21 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         ),
       );
     } catch (e) {
-      print("========================================");
-      print("ERROR LOADING ETALON");
-      print("Error loading reference table: $e");
-      print("========================================");
+      appTalker.error("ERROR LOADING ETALON", e);
     }
   }
 
   void _printSavedRepetitionTables(SharedPreferences prefs) {
     final rawTables = prefs.getString(_repetitionTablesKey);
     if (rawTables == null) {
-      print("========================================");
-      print("REPETITION TABLES STATUS: NOT FOUND");
-      print("========================================");
+      appTalker.warning("REPETITION TABLES STATUS: NOT FOUND");
       return;
     }
 
     try {
       final decoded = jsonDecode(rawTables) as List;
-      print("========================================");
-      print("SAVED REPETITION TABLES LOADED");
-      print("Всего таблиц: ${decoded.length}");
-      print("========================================");
+      appTalker.info(
+          "SAVED REPETITION TABLES LOADED. Всего таблиц: ${decoded.length}");
 
       for (int i = 0; i < decoded.length; i++) {
         final tableRaw = decoded[i] as List;
@@ -897,19 +1029,14 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         _printRepetitionTable(i + 1, tableRows);
       }
     } catch (e) {
-      print("========================================");
-      print("ERROR LOADING REPETITION TABLES");
-      print("Error: $e");
-      print("========================================");
+      appTalker.error("ERROR LOADING REPETITION TABLES", e);
     }
   }
 
   void _printSavedPhaseProfile(SharedPreferences prefs) {
     final rawProfile = prefs.getString(_phaseProfileKey);
     if (rawProfile == null) {
-      print("========================================");
-      print("PHASE PROFILE STATUS: NOT FOUND");
-      print("========================================");
+      appTalker.warning("PHASE PROFILE STATUS: NOT FOUND");
       return;
     }
 
@@ -921,11 +1048,13 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       final emg = (decoded['emg'] as List).map((e) => (e as num).toDouble());
       final time = (decoded['time'] as List).map((e) => (e as num).toDouble());
 
-      print("========================================");
-      print("PHASE PROFILE LOADED");
-      print(
+      appTalker.info("PHASE PROFILE LOADED");
+      appTalker.info(
           "points: phi=${phi.length}, theta=${theta.length}, emg=${emg.length}, time=${time.length}");
-      if (phi.isNotEmpty && theta.isNotEmpty && emg.isNotEmpty && time.isNotEmpty) {
+      if (phi.isNotEmpty &&
+          theta.isNotEmpty &&
+          emg.isNotEmpty &&
+          time.isNotEmpty) {
         print(
             "sample[0]: phi=${phi.first.toStringAsFixed(2)}, theta=${theta.first.toStringAsFixed(2)}, emg=${emg.first.toStringAsFixed(2)}, time=${time.first.toStringAsFixed(1)}");
         print(
@@ -936,12 +1065,9 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         emg: emg.toList(),
         time: time.toList(),
       );
-      print("========================================");
+      appTalker.info("PHASE PROFILE LOAD COMPLETED");
     } catch (e) {
-      print("========================================");
-      print("ERROR LOADING PHASE PROFILE");
-      print("Error: $e");
-      print("========================================");
+      appTalker.error("ERROR LOADING PHASE PROFILE", e);
     }
   }
 
@@ -950,9 +1076,11 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     required List<double> emg,
     required List<double> time,
   }) {
-    print("theta=[${theta.map((v) => v.toStringAsFixed(4)).join(', ')}]");
-    print("emg=[${emg.map((v) => v.toStringAsFixed(4)).join(', ')}]");
-    print("time=[${time.map((v) => v.toStringAsFixed(4)).join(', ')}]");
+    appTalker
+        .info("theta=[${theta.map((v) => v.toStringAsFixed(4)).join(', ')}]");
+    appTalker.info("emg=[${emg.map((v) => v.toStringAsFixed(4)).join(', ')}]");
+    appTalker
+        .info("time=[${time.map((v) => v.toStringAsFixed(4)).join(', ')}]");
   }
 
   // ==================== COMPARISON MODE ====================
@@ -962,18 +1090,17 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     Emitter<BleState> emit,
   ) async {
     if (_referenceSegments.isEmpty) {
-      print("Cannot start comparison: no reference data");
+      appTalker.warning("Cannot start comparison: no reference data");
       return;
     }
 
     _isComparing = true;
     _comparisonStartTime = DateTime.now();
-
-    // Запускаем таймер для обновления времени
     _comparisonTimer?.cancel();
-    _comparisonTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
+    _comparisonTimer = Timer.periodic(
+        const Duration(milliseconds: _inPacketSampleSpacingMs), (_) {
       if (_isComparing && _comparisonStartTime != null) {
-        add(BleResetComparison()); // Используем для обновления времени
+        add(BleResetComparison());
       }
     });
 
@@ -1032,13 +1159,20 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   double _getReferenceAngleAtTime(int elapsedMs) {
     if (_referenceSegments.isEmpty) return 0.0;
 
+    final totalDurationMs =
+        _referenceSegments.fold<int>(0, (sum, seg) => sum + seg.timeMs);
+    if (totalDurationMs <= 0) return _referenceSegments.last.avgAngle;
+
+    // Loop reference trajectory by time.
+    final loopedElapsed = elapsedMs % totalDurationMs;
+
     int cumulativeTime = 0;
 
     for (int i = 0; i < _referenceSegments.length; i++) {
       final segment = _referenceSegments[i];
       cumulativeTime += segment.timeMs;
 
-      if (elapsedMs <= cumulativeTime) {
+      if (loopedElapsed <= cumulativeTime) {
         // Находимся в этом сегменте
         return segment.avgAngle;
       }
@@ -1069,7 +1203,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     BleStartDataStream event,
     Emitter<BleState> emit,
   ) async {
-    print("Запуск потока данных");
+    appTalker.info("Запуск потока данных");
     await _bleService.resumeDataStream();
     // _testDataGenerator.start();
   }
@@ -1078,8 +1212,11 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     BleStopDataStream event,
     Emitter<BleState> emit,
   ) async {
-    print("Остановка потока данных");
+    appTalker.info("Остановка потока данных");
     _bleService.pauseDataStream();
+    _anglePlaybackQueue.clear();
+    _uiTickTimer?.cancel();
+    _uiTickTimer = null;
     // _testDataGenerator.stop();
   }
 
@@ -1087,7 +1224,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     BleUpdateAngleBorders event,
     Emitter<BleState> emit,
   ) async {
-    print("Обновление границ углов: ${event.minAngle}° - ${event.maxAngle}°");
+    appTalker.info(
+        "Обновление границ углов: ${event.minAngle}° - ${event.maxAngle}°");
     _minAngle = event.minAngle;
     _maxAngle = event.maxAngle;
     await _saveAngleBordersToStorage(event.minAngle, event.maxAngle);
@@ -1106,6 +1244,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   @override
   Future<void> close() async {
     _comparisonTimer?.cancel();
+    _uiTickTimer?.cancel();
     _bleService.dispose();
     // _testDataGenerator.dispose();
     return super.close();

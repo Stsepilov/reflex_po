@@ -43,7 +43,6 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
   }
 
   Widget _buildComparisonInfo(BleState state, AppThemeExtension themeExt) {
-    final seconds = (state.elapsedTimeMs / 1000).toStringAsFixed(1);
     final currentAngle = state.values.isNotEmpty ? state.values.last : 0.0;
 
     return Padding(
@@ -51,11 +50,6 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
-          _buildInfoCard(
-            'Время',
-            '${seconds}s',
-            themeExt,
-          ),
           _buildInfoCard(
             'Текущий',
             '${currentAngle.toStringAsFixed(1)}°',
@@ -214,11 +208,18 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
 
                 const SizedBox(height: 5),
 
-                // Индикатор углов
-                AngleIndicator(
-                  currentAngle: angle,
-                  referenceAngle: state.currentReferenceAngle,
-                  showReference: state.isComparing,
+                // Индикатор углов с плавной интерполяцией между тиками данных
+                TweenAnimationBuilder<double>(
+                  tween: Tween<double>(end: angle),
+                  duration: const Duration(milliseconds: 10),
+                  curve: Curves.linear,
+                  builder: (context, animatedAngle, child) {
+                    return AngleIndicator(
+                      currentAngle: animatedAngle,
+                      referenceAngle: state.currentReferenceAngle,
+                      showReference: state.isComparing,
+                    );
+                  },
                 ),
 
                 const SizedBox(height: 5),

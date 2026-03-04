@@ -20,14 +20,16 @@ class BleLoadReference extends BleEvent {}
 class BleNewDataReceived extends BleEvent {
   final List<double> angleValues;
   final List<double> emgValues;
+  final List<double> timeValues;
 
   BleNewDataReceived({
     required this.angleValues,
     required this.emgValues,
+    required this.timeValues,
   });
 
   @override
-  List<Object?> get props => [angleValues, emgValues];
+  List<Object?> get props => [angleValues, emgValues, timeValues];
 }
 
 class BleStartReferenceRecording extends BleEvent {
@@ -67,3 +69,5 @@ class BleUpdateAngleBorders extends BleEvent {
   @override
   List<Object?> get props => [minAngle, maxAngle];
 }
+
+class BleUiTick extends BleEvent {}
