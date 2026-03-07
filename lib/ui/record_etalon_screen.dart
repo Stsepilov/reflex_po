@@ -18,6 +18,7 @@ class RecordEtalonScreen extends StatefulWidget {
 
 class _RecordEtalonScreenState extends State<RecordEtalonScreen> {
   BleBloc? _bleBloc;
+  bool _isBaselineDialogActive = false;
 
   @override
   void didChangeDependencies() {
@@ -30,9 +31,34 @@ class _RecordEtalonScreenState extends State<RecordEtalonScreen> {
   void initState() {
     super.initState();
     // Запускаем поток данных при входе на экран
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       context.read<BleBloc>().add(BleStartDataStream());
+      await _runBaselineCalibrationDialog();
     });
+  }
+
+  Future<void> _runBaselineCalibrationDialog() async {
+    if (!mounted || _isBaselineDialogActive) return;
+    _isBaselineDialogActive = true;
+    context.read<BleBloc>().add(BleStartBaselineCalibration());
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        Future.delayed(const Duration(seconds: 3), () {
+          if (Navigator.of(dialogContext).canPop()) {
+            Navigator.of(dialogContext).pop();
+          }
+        });
+        return AlertDialog(
+          title: const Text('Калибровка EMG'),
+          content: const Text('Пожалуйста, держите руку в покое 3 секунды.'),
+        );
+      },
+    );
+
+    _isBaselineDialogActive = false;
   }
 
   @override
@@ -61,6 +87,8 @@ class _RecordEtalonScreenState extends State<RecordEtalonScreen> {
                     if (isRecording) {
                       context.read<BleBloc>().add(BleStopReferenceRecording());
                     } else {
+                      await _runBaselineCalibrationDialog();
+                      if (!context.mounted) return;
                       // Use borders from state
                       context.read<BleBloc>().add(
                             BleStartReferenceRecording(

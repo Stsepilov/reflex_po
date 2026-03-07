@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:convert';
+import 'dart:developer' as dev;
 import 'dart:math';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'ble_event.dart';
@@ -39,10 +39,9 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   // UI/state buffers to avoid data loss between throttled emits
   final List<double> _anglesForUi = [];
   final List<double> _emgForUi = [];
-  final Queue<double> _anglePlaybackQueue = Queue<double>();
-  Timer? _uiTickTimer;
-  static const int _uiTickMs = _inPacketSampleSpacingMs;
+  final List<double> _emgMedianWindow = [];
   int _emgSampleCount = 0;
+  double? _emgEmaValue;
   double _latestAngle = 0.0;
   double? _emaAngle;
   // Adaptive EMA: lower alpha for calm motion, higher alpha for sharp motion.
@@ -50,6 +49,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   static const double _angleEmaAlphaMax = 0.85;
   static const double _emaSlowDeltaDeg = 0.5;
   static const double _emaFastDeltaDeg = 8.0;
+  static const int _emgMedianWindowSize = 3;
+  static const double _emgEmaDtSeconds = 0.02;
+  static const double _emgEmaTauUpSeconds = 0.08;
+  static const double _emgEmaTauDownSeconds = 0.18;
 
   // Repetition tracking (max -> min -> max)
   int _completedReps = 0;
@@ -87,6 +90,13 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   bool _isComparing = false;
   DateTime? _comparisonStartTime;
   Timer? _comparisonTimer;
+
+  // EMG baseline calibration
+  static const int _baselineCalibrationDurationMs = 3000;
+  double _emgBaseline = 0.0;
+  bool _isCollectingBaseline = false;
+  final List<double> _baselineSamples = [];
+  Timer? _baselineTimer;
 
   // Performance monitoring
   int _droppedFrames = 0;
@@ -143,7 +153,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     on<BleStartDataStream>(_onStartDataStream);
     on<BleStopDataStream>(_onStopDataStream);
     on<BleUpdateAngleBorders>(_onUpdateAngleBorders);
-    on<BleUiTick>(_onUiTick);
+    on<BleStartBaselineCalibration>(_onStartBaselineCalibration);
+    on<BleFinishBaselineCalibration>(_onFinishBaselineCalibration);
   }
 
   Future<void> _onStartScan(BleStartScan event, Emitter<BleState> emit) async {
@@ -160,10 +171,9 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     // _testDataGenerator.stop();
     _anglesForUi.clear();
     _emgForUi.clear();
-    _anglePlaybackQueue.clear();
-    _uiTickTimer?.cancel();
-    _uiTickTimer = null;
+    _emgMedianWindow.clear();
     _emgSampleCount = 0;
+    _emgEmaValue = null;
     _latestAngle = 0.0;
     _emaAngle = null;
 
@@ -198,7 +208,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     }
     _lastProcessTime = now;
 
-    // Queue packet angles and render them sequentially between BLE packets.
+    // Process and render packet angles immediately (without playback queue).
     if (event.angleValues.isNotEmpty) {
       for (final rawAngle in event.angleValues) {
         if (_emaAngle == null) {
@@ -207,16 +217,34 @@ class BleBloc extends Bloc<BleEvent, BleState> {
           final alpha = _adaptiveEmaAlpha(rawAngle);
           _emaAngle = alpha * rawAngle + (1 - alpha) * _emaAngle!;
         }
-        _anglePlaybackQueue.add(_emaAngle!);
+        _latestAngle = _emaAngle!;
+        _anglesForUi.add(_latestAngle);
       }
-      _ensureUiTickTimerRunning();
+      if (_anglesForUi.length > 500) {
+        _anglesForUi.removeRange(0, _anglesForUi.length - 500);
+      }
     }
 
+    final adjustedPacketEmg = <double>[];
     if (event.emgValues.isNotEmpty) {
-      final avgEmg =
-          event.emgValues.reduce((a, b) => a + b) / event.emgValues.length;
-      _emgForUi.add(avgEmg);
-      _emgSampleCount++;
+      final packetEmg = event.emgValues;
+      if (_isCollectingBaseline) {
+        _baselineSamples.addAll(packetEmg);
+      } else {
+        for (final emgValue in packetEmg) {
+          final adjusted = _applyBaseline(emgValue);
+          final medianFiltered = _nextEmgMedian(adjusted);
+          if (medianFiltered == null) {
+            continue;
+          }
+
+          final emaFiltered = _updateEmgAttackReleaseEma(medianFiltered);
+
+          adjustedPacketEmg.add(emaFiltered);
+          _emgForUi.add(emaFiltered);
+          _emgSampleCount++;
+        }
+      }
 
       if (_emgForUi.length > 500) {
         _emgForUi.removeRange(0, _emgForUi.length - 500);
@@ -227,45 +255,19 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     if (_isRecordingReference) {
       _processReferenceData(
         event.angleValues,
-        event.emgValues,
+        adjustedPacketEmg,
         event.timeValues,
       );
     }
 
-    // Comparison state is updated by dedicated 20 Hz timer.
-  }
-
-  Future<void> _onUiTick(BleUiTick event, Emitter<BleState> emit) async {
-    if (_anglePlaybackQueue.isEmpty) return;
-
-    final samplesToRender = _anglePlaybackQueue.length >= 12
-        ? 4
-        : (_anglePlaybackQueue.length >= 6 ? 2 : 1);
-
-    for (int i = 0; i < samplesToRender; i++) {
-      if (_anglePlaybackQueue.isEmpty) break;
-      _latestAngle = _anglePlaybackQueue.removeFirst();
-      _anglesForUi.add(_latestAngle);
-    }
-    if (_anglesForUi.length > 500) {
-      _anglesForUi.removeRange(0, _anglesForUi.length - 500);
-    }
-
-    final emgStartX = _emgSampleCount - _emgForUi.length;
+    // Update charts directly on new packets.
+    final emgStartX =
+        (_emgSampleCount - _emgForUi.length) * _inPacketSampleSpacingMs;
     emit(state.copyWith(
       values: List<double>.from(_anglesForUi),
       emgValues: List<double>.from(_emgForUi),
       emgStartX: emgStartX < 0 ? 0 : emgStartX,
     ));
-  }
-
-  void _ensureUiTickTimerRunning() {
-    _uiTickTimer ??=
-        Timer.periodic(const Duration(milliseconds: _uiTickMs), (_) {
-      if (!isClosed && _anglePlaybackQueue.isNotEmpty) {
-        add(BleUiTick());
-      }
-    });
   }
 
   double _adaptiveEmaAlpha(double rawAngle) {
@@ -278,6 +280,78 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     final t =
         (delta - _emaSlowDeltaDeg) / (_emaFastDeltaDeg - _emaSlowDeltaDeg);
     return _angleEmaAlphaMin + (_angleEmaAlphaMax - _angleEmaAlphaMin) * t;
+  }
+
+  double? _nextEmgMedian(double emgValue) {
+    _emgMedianWindow.add(emgValue);
+    if (_emgMedianWindow.length < _emgMedianWindowSize) {
+      return null;
+    }
+
+    if (_emgMedianWindow.length > _emgMedianWindowSize) {
+      _emgMedianWindow.removeAt(0);
+    }
+
+    return _median(_emgMedianWindow);
+  }
+
+  double _updateEmgAttackReleaseEma(double x) {
+    _emgEmaValue ??= x;
+    final yPrev = _emgEmaValue!;
+    final rising = x > yPrev;
+    final tau = rising ? _emgEmaTauUpSeconds : _emgEmaTauDownSeconds;
+    final alpha = 1.0 - exp(-_emgEmaDtSeconds / tau);
+    final yNew = yPrev + alpha * (x - yPrev);
+    _emgEmaValue = yNew;
+    return yNew;
+  }
+
+  double _applyBaseline(double emgValue) {
+    return (emgValue - _emgBaseline).abs();
+  }
+
+  Future<void> _onStartBaselineCalibration(
+    BleStartBaselineCalibration event,
+    Emitter<BleState> emit,
+  ) async {
+    _baselineTimer?.cancel();
+    _baselineSamples.clear();
+    _emgMedianWindow.clear();
+    _emgEmaValue = null;
+    _isCollectingBaseline = true;
+    appTalker.info(
+      "EMG baseline calibration started (${_baselineCalibrationDurationMs}ms)",
+    );
+    _baselineTimer = Timer(
+      const Duration(milliseconds: _baselineCalibrationDurationMs),
+      () {
+        if (!isClosed) {
+          add(BleFinishBaselineCalibration());
+        }
+      },
+    );
+  }
+
+  Future<void> _onFinishBaselineCalibration(
+    BleFinishBaselineCalibration event,
+    Emitter<BleState> emit,
+  ) async {
+    _baselineTimer?.cancel();
+    _baselineTimer = null;
+    _isCollectingBaseline = false;
+
+    if (_baselineSamples.isEmpty) {
+      appTalker.warning(
+        "EMG baseline calibration finished without samples. Keep previous baseline=$_emgBaseline",
+      );
+      return;
+    }
+
+    _emgBaseline = _median(_baselineSamples);
+    appTalker.info(
+      "EMG baseline calibration finished: baseline=$_emgBaseline, samples=${_baselineSamples.length}",
+    );
+    _baselineSamples.clear();
   }
 
   Future<void> _onStartReference(
@@ -422,9 +496,22 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         final emgPchip = Pchip(timeSeries['phi']!, timeSeries['emg']!);
         final timePchip = Pchip(angleSeries['phi']!, angleSeries['time']!);
 
-        thetaTrials.add(thetaPchip.resample(phiGrid));
-        emgTrials.add(emgPchip.resample(phiGrid));
-        timeTrials.add(timePchip.resample(phiGrid));
+        final thetaResampled = thetaPchip.resample(phiGrid);
+        final emgResampled = emgPchip.resample(phiGrid);
+        final timeResampled = timePchip.resample(phiGrid);
+        thetaTrials.add(thetaResampled);
+        emgTrials.add(emgResampled);
+        timeTrials.add(timeResampled);
+
+        _logInterpolationTrial(
+          trialIndex: thetaTrials.length - 1,
+          timeSeries: timeSeries,
+          angleSeries: angleSeries,
+          phiGrid: phiGrid,
+          thetaResampled: thetaResampled,
+          emgResampled: emgResampled,
+          timeResampled: timeResampled,
+        );
       } catch (e) {
         appTalker
             .warning("Эталон: пропуск таблицы при фазовой интерполяции: $e");
@@ -461,6 +548,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     appTalker.info(
         "Эталон: фазовая нормализация готова (trials=${thetaTrials.length}, points=$_phaseGridPoints)");
     _printFinalReferenceArrays(
+      phi: _phasePhi,
       theta: _phaseTheta,
       emg: _phaseEmg,
       time: _phaseTime,
@@ -468,23 +556,48 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     return true;
   }
 
+  void _logInterpolationTrial({
+    required int trialIndex,
+    required Map<String, List<double>> timeSeries,
+    required Map<String, List<double>> angleSeries,
+    required List<double> phiGrid,
+    required List<double> thetaResampled,
+    required List<double> emgResampled,
+    required List<double> timeResampled,
+  }) {
+    dev.log(
+      "Interpolation trial #$trialIndex input(time): "
+      "phi=[${timeSeries['phi']!.join(', ')}], "
+      "theta=[${timeSeries['theta']!.join(', ')}], "
+      "emg=[${timeSeries['emg']!.join(', ')}]",
+      name: 'BleBloc.Interpolation',
+    );
+    dev.log(
+      "Interpolation trial #$trialIndex input(angle): "
+      "phi=[${angleSeries['phi']!.join(', ')}], "
+      "time=[${angleSeries['time']!.join(', ')}]",
+      name: 'BleBloc.Interpolation',
+    );
+    dev.log(
+      "Interpolation trial #$trialIndex grid/resampled: "
+      "phiGrid=[${phiGrid.join(', ')}], "
+      "theta=[${thetaResampled.join(', ')}], "
+      "emg=[${emgResampled.join(', ')}], "
+      "time=[${timeResampled.join(', ')}]",
+      name: 'BleBloc.Interpolation',
+    );
+  }
+
   Map<String, List<double>>? _buildTimePhaseSeries(List<FinalSegment> table) {
     if (table.isEmpty) return null;
 
-    final theta = <double>[];
-    final emg = <double>[];
-    final cumulativeTime = <double>[];
+    final nodes = _buildAngleTimeNodes(table);
+    if (nodes == null) return null;
+    final theta = nodes['theta']!;
+    final emg = nodes['emg']!;
+    final cumulativeTime = nodes['time']!;
 
-    double runningTime = 0.0;
-    for (final row in table) {
-      final dt = max(0, row.timeMs);
-      runningTime += dt;
-      theta.add(row.firstAvgAngle);
-      emg.add(row.avgEmg);
-      cumulativeTime.add(runningTime);
-    }
-
-    final totalTime = runningTime;
+    final totalTime = cumulativeTime.last;
     if (totalTime <= 0) return null;
 
     final phi = cumulativeTime.map((t) => t / totalTime).toList();
@@ -502,18 +615,17 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Map<String, List<double>>? _buildAnglePhaseSeries(List<FinalSegment> table) {
     if (table.isEmpty) return null;
 
-    final cumulativeAngle = <double>[];
-    final cumulativeTime = <double>[];
-    double runningAngle = 0.0;
-    double runningTime = 0.0;
+    final nodes = _buildAngleTimeNodes(table);
+    if (nodes == null) return null;
+    final theta = nodes['theta']!;
+    final cumulativeTime = nodes['time']!;
 
-    for (final row in table) {
-      final dTheta = row.absoluteAngle.abs();
-      final dt = max(0, row.timeMs);
+    final cumulativeAngle = <double>[0.0];
+    var runningAngle = 0.0;
+    for (int i = 1; i < theta.length; i++) {
+      final dTheta = (theta[i] - theta[i - 1]).abs();
       runningAngle += dTheta;
-      runningTime += dt;
       cumulativeAngle.add(runningAngle);
-      cumulativeTime.add(runningTime);
     }
 
     if (runningAngle <= 0) return null;
@@ -523,6 +635,30 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     return {
       'phi': strict['x']!,
       'time': strict['y']!,
+    };
+  }
+
+  Map<String, List<double>>? _buildAngleTimeNodes(List<FinalSegment> table) {
+    if (table.isEmpty) return null;
+
+    final theta = <double>[table.first.firstAvgAngle];
+    final emg = <double>[table.first.avgEmg];
+    final cumulativeTime = <double>[0.0];
+
+    var runningTime = 0.0;
+    for (final row in table) {
+      final dt = max(0, row.timeMs).toDouble();
+      runningTime += dt;
+      theta.add(row.lastAvgAngle);
+      emg.add(row.avgEmg);
+      cumulativeTime.add(runningTime);
+    }
+
+    if (theta.length < 2 || cumulativeTime.length < 2) return null;
+    return {
+      'theta': theta,
+      'emg': emg,
+      'time': cumulativeTime,
     };
   }
 
@@ -591,11 +727,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     if (cumulativeTime.isEmpty) return [];
 
     final result = List<int>.filled(cumulativeTime.length, 1);
-    var prev = 0.0;
-    for (int i = 0; i < cumulativeTime.length; i++) {
-      final dt = (cumulativeTime[i] - prev).round();
+    result[0] = 0; // phi=0 must correspond to the initial angle at t=0.
+    for (int i = 1; i < cumulativeTime.length; i++) {
+      final dt = (cumulativeTime[i] - cumulativeTime[i - 1]).round();
       result[i] = dt <= 0 ? 1 : dt;
-      prev = cumulativeTime[i];
     }
     return result;
   }
@@ -1040,12 +1175,17 @@ class BleBloc extends Bloc<BleEvent, BleState> {
           theta.isNotEmpty &&
           emg.isNotEmpty &&
           time.isNotEmpty) {
-        print(
-            "sample[0]: phi=${phi.first.toStringAsFixed(2)}, theta=${theta.first.toStringAsFixed(2)}, emg=${emg.first.toStringAsFixed(2)}, time=${time.first.toStringAsFixed(1)}");
-        print(
-            "sample[last]: phi=${phi.last.toStringAsFixed(2)}, theta=${theta.last.toStringAsFixed(2)}, emg=${emg.last.toStringAsFixed(2)}, time=${time.last.toStringAsFixed(1)}");
+        dev.log(
+          "sample[0]: phi=${phi.first}, theta=${theta.first}, emg=${emg.first}, time=${time.first}",
+          name: 'BleBloc.PhaseProfile',
+        );
+        dev.log(
+          "sample[last]: phi=${phi.last}, theta=${theta.last}, emg=${emg.last}, time=${time.last}",
+          name: 'BleBloc.PhaseProfile',
+        );
       }
       _printFinalReferenceArrays(
+        phi: phi.toList(),
         theta: theta.toList(),
         emg: emg.toList(),
         time: time.toList(),
@@ -1057,15 +1197,15 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   }
 
   void _printFinalReferenceArrays({
+    required List<double> phi,
     required List<double> theta,
     required List<double> emg,
     required List<double> time,
   }) {
-    appTalker
-        .info("theta=[${theta.map((v) => v.toStringAsFixed(4)).join(', ')}]");
-    appTalker.info("emg=[${emg.map((v) => v.toStringAsFixed(4)).join(', ')}]");
-    appTalker
-        .info("time=[${time.map((v) => v.toStringAsFixed(4)).join(', ')}]");
+    dev.log("phi=[${phi.join(', ')}]", name: 'BleBloc.ReferenceArrays');
+    dev.log("theta=[${theta.join(', ')}]", name: 'BleBloc.ReferenceArrays');
+    dev.log("emg=[${emg.join(', ')}]", name: 'BleBloc.ReferenceArrays');
+    dev.log("time=[${time.join(', ')}]", name: 'BleBloc.ReferenceArrays');
   }
 
   // ==================== COMPARISON MODE ====================
@@ -1198,10 +1338,9 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     Emitter<BleState> emit,
   ) async {
     appTalker.info("Остановка потока данных");
+    _emgMedianWindow.clear();
+    _emgEmaValue = null;
     _bleService.pauseDataStream();
-    _anglePlaybackQueue.clear();
-    _uiTickTimer?.cancel();
-    _uiTickTimer = null;
     // _testDataGenerator.stop();
   }
 
@@ -1229,7 +1368,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   @override
   Future<void> close() async {
     _comparisonTimer?.cancel();
-    _uiTickTimer?.cancel();
+    _baselineTimer?.cancel();
     _bleService.dispose();
     // _testDataGenerator.dispose();
     return super.close();

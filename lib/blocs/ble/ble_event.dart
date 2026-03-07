@@ -70,4 +70,8 @@ class BleUpdateAngleBorders extends BleEvent {
   List<Object?> get props => [minAngle, maxAngle];
 }
 
+class BleStartBaselineCalibration extends BleEvent {}
+
+class BleFinishBaselineCalibration extends BleEvent {}
+
 class BleUiTick extends BleEvent {}

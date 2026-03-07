@@ -3,6 +3,7 @@ import 'package:fl_chart/fl_chart.dart';
 import '../themes/theme_extensions.dart';
 
 class PulseChart extends StatelessWidget {
+  static const int _sampleSpacingMs = 20;
   final List<double> values;
   final int xStart;
 
@@ -15,12 +16,12 @@ class PulseChart extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final themeExt = Theme.of(context).extension<AppThemeExtension>()!;
-    
+
     // Sliding window over fixed-size buffer with global X offset.
     final minX = xStart.toDouble();
     final maxX = values.isEmpty
         ? minX + 1
-        : (xStart + values.length - 1).toDouble();
+        : (xStart + (values.length - 1) * _sampleSpacingMs).toDouble();
 
     // Auto-scale Y axis based on EMG values
     double maxY = 5000; // Default max for EMG
@@ -92,7 +93,7 @@ class PulseChart extends StatelessWidget {
             bottomTitles: AxisTitles(
               sideTitles: SideTitles(
                 showTitles: true,
-                interval: 100, // каждые 100 точек подпись
+                interval: 1000, // подпись по оси времени каждые 1000 мс
                 reservedSize: 24,
                 getTitlesWidget: (value, _) {
                   // Показываем только если значение в видимом диапазоне
@@ -119,7 +120,10 @@ class PulseChart extends StatelessWidget {
             LineChartBarData(
               spots: [
                 for (int i = 0; i < values.length; i++)
-                  FlSpot((xStart + i).toDouble(), values[i])
+                  FlSpot(
+                    (xStart + i * _sampleSpacingMs).toDouble(),
+                    values[i],
+                  )
               ],
               isCurved: false,
               color: themeExt.primaryColor,
