@@ -65,10 +65,11 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   static const double _shiftAngleThreshold = 5.0;
   static const double _directionEpsilon = 0.5;
   static const double _turnConfirmationDelta = 2.0;
-  static const double _extremaTolerance = 5.0;
+  static const int _turnDirectionConfirmationSamples = 8;
   double? _pendingPivotAngle;
   _MovementDirection _pendingDirection = _MovementDirection.unknown;
   _MovementDirection _directionBeforePending = _MovementDirection.unknown;
+  final List<_MovementDirection> _pendingDirectionWindow = [];
 
   // Shift table for all data points (global second table)
   final List<FinalSegment> _finalSegments = [];
@@ -85,6 +86,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   List<double> _phaseTheta = [];
   List<double> _phaseEmg = [];
   List<double> _phaseTime = [];
+  bool _awaitingTerminalEmgSample = false;
+  double? _terminalEmgFromNextPacket;
 
   // Comparison mode
   bool _isComparing = false;
@@ -369,12 +372,15 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _pendingPivotAngle = null;
     _pendingDirection = _MovementDirection.unknown;
     _directionBeforePending = _MovementDirection.unknown;
+    _pendingDirectionWindow.clear();
 
     _finalSegments.clear();
     _currentTempTable.clear();
     _currentRepTable.clear();
     _repetitionTables.clear();
     _lastRecordedSampleTimeMs = -1;
+    _awaitingTerminalEmgSample = false;
+    _terminalEmgFromNextPacket = null;
 
     appTalker.info(
         "Эталон: старт записи ($_targetReps повторений, $_maxAngle° → $_minAngle° → $_maxAngle°)");
@@ -386,6 +392,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     Emitter<BleState> emit,
   ) async {
     _isRecordingReference = false;
+    _awaitingTerminalEmgSample = false;
 
     // Flush current temp table if it already reached threshold but was not
     // finalized yet due to manual stop timing.
@@ -484,8 +491,17 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     final List<List<double>> emgTrials = [];
     final List<List<double>> timeTrials = [];
 
-    for (final table in repTables) {
-      final timeSeries = _buildTimePhaseSeries(table);
+    for (int trialIndex = 0; trialIndex < repTables.length; trialIndex++) {
+      final table = repTables[trialIndex];
+      final nextRepFirstAvgEmg = trialIndex + 1 < repTables.length
+          ? (repTables[trialIndex + 1].isNotEmpty
+              ? repTables[trialIndex + 1].first.avgEmg
+              : null)
+          : _terminalEmgFromNextPacket;
+      final timeSeries = _buildTimePhaseSeries(
+        table,
+        nextRepFirstAvgEmg: nextRepFirstAvgEmg,
+      );
       final angleSeries = _buildAnglePhaseSeries(table);
       if (timeSeries == null || angleSeries == null) {
         continue;
@@ -588,10 +604,16 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     );
   }
 
-  Map<String, List<double>>? _buildTimePhaseSeries(List<FinalSegment> table) {
+  Map<String, List<double>>? _buildTimePhaseSeries(
+    List<FinalSegment> table, {
+    double? nextRepFirstAvgEmg,
+  }) {
     if (table.isEmpty) return null;
 
-    final nodes = _buildAngleTimeNodes(table);
+    final nodes = _buildAngleTimeNodes(
+      table,
+      nextRepFirstAvgEmg: nextRepFirstAvgEmg,
+    );
     if (nodes == null) return null;
     final theta = nodes['theta']!;
     final emg = nodes['emg']!;
@@ -638,11 +660,14 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     };
   }
 
-  Map<String, List<double>>? _buildAngleTimeNodes(List<FinalSegment> table) {
+  Map<String, List<double>>? _buildAngleTimeNodes(
+    List<FinalSegment> table, {
+    double? nextRepFirstAvgEmg,
+  }) {
     if (table.isEmpty) return null;
 
     final theta = <double>[table.first.firstAvgAngle];
-    final emg = <double>[table.first.avgEmg];
+    final emg = <double>[];
     final cumulativeTime = <double>[0.0];
 
     var runningTime = 0.0;
@@ -653,6 +678,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       emg.add(row.avgEmg);
       cumulativeTime.add(runningTime);
     }
+    emg.add(nextRepFirstAvgEmg ?? table.last.avgEmg);
 
     if (theta.length < 2 || cumulativeTime.length < 2) return null;
     return {
@@ -753,6 +779,17 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   ) {
     if (!_isRecordingReference || _recordingStartTime == null) return;
     if (newAngles.isEmpty || newEmgValues.isEmpty) return;
+
+    if (_awaitingTerminalEmgSample) {
+      _terminalEmgFromNextPacket = _valueAtOrLast(newEmgValues, 0);
+      _awaitingTerminalEmgSample = false;
+      appTalker.info(
+        "Эталон: финальная EMG-точка взята из следующего пакета: $_terminalEmgFromNextPacket",
+      );
+      _isRecordingReference = false;
+      add(BleStopReferenceRecording());
+      return;
+    }
 
     final packetTimeMs =
         DateTime.now().difference(_recordingStartTime!).inMilliseconds;
@@ -891,49 +928,71 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       return;
     }
 
-    if (_pendingDirection == _MovementDirection.unknown &&
-        _lastDirection != _MovementDirection.unknown &&
-        newDirection != _lastDirection) {
-      // First opposite sample: register a pivot candidate and wait for
-      // additional movement in the new direction to confirm the turn.
-      _pendingPivotAngle = _previousAvgAngle!;
-      _pendingDirection = newDirection;
-      _directionBeforePending = _lastDirection;
+    if (_pendingDirection == _MovementDirection.unknown) {
+      if (_lastDirection != _MovementDirection.unknown &&
+          newDirection != _lastDirection) {
+        // First opposite sample: register a pivot candidate and require a
+        // stable run of samples in the new direction before confirming turn.
+        _pendingPivotAngle = _previousAvgAngle!;
+        _pendingDirection = newDirection;
+        _directionBeforePending = _lastDirection;
+        _pendingDirectionWindow
+          ..clear()
+          ..add(newDirection);
+        _previousAvgAngle = currentAvgAngle;
+        return;
+      }
+
+      _lastDirection = newDirection;
       _previousAvgAngle = currentAvgAngle;
       return;
     }
 
-    if (_pendingDirection != _MovementDirection.unknown) {
-      if (newDirection != _pendingDirection) {
-        // Reversal was not stable, drop candidate.
-        _pendingPivotAngle = null;
-        _pendingDirection = _MovementDirection.unknown;
-        _directionBeforePending = _MovementDirection.unknown;
-      } else if (_pendingPivotAngle != null) {
-        final movedInNewDirection =
-            (currentAvgAngle - _pendingPivotAngle!).abs();
-        if (movedInNewDirection >= _turnConfirmationDelta) {
-          final extremumAngle = _pendingPivotAngle!;
-          if (_directionBeforePending == _MovementDirection.up &&
-              _pendingDirection == _MovementDirection.down) {
-            _onLocalMaximum(extremumAngle);
-          } else if (_directionBeforePending == _MovementDirection.down &&
-              _pendingDirection == _MovementDirection.up) {
-            _onLocalMinimum(extremumAngle);
-          }
+    if (newDirection != _pendingDirection) {
+      _resetPendingTurnCandidate();
+      _lastDirection = newDirection;
+      _previousAvgAngle = currentAvgAngle;
+      return;
+    }
 
-          _lastDirection = _pendingDirection;
-          _pendingPivotAngle = null;
-          _pendingDirection = _MovementDirection.unknown;
-          _directionBeforePending = _MovementDirection.unknown;
-          _previousAvgAngle = currentAvgAngle;
-          return;
+    _pendingDirectionWindow.add(newDirection);
+    if (_pendingDirectionWindow.length > _turnDirectionConfirmationSamples) {
+      _pendingDirectionWindow.removeAt(0);
+    }
+
+    if (_pendingPivotAngle != null) {
+      final movedInNewDirection = (currentAvgAngle - _pendingPivotAngle!).abs();
+      if (_isPendingDirectionStable() &&
+          movedInNewDirection >= _turnConfirmationDelta) {
+        final extremumAngle = _pendingPivotAngle!;
+        if (_directionBeforePending == _MovementDirection.up &&
+            _pendingDirection == _MovementDirection.down) {
+          _onLocalMaximum(extremumAngle);
+        } else if (_directionBeforePending == _MovementDirection.down &&
+            _pendingDirection == _MovementDirection.up) {
+          _onLocalMinimum(extremumAngle);
         }
+
+        _lastDirection = _pendingDirection;
+        _resetPendingTurnCandidate();
       }
     }
 
-    _lastDirection = newDirection;
     _previousAvgAngle = currentAvgAngle;
+  }
+
+  bool _isPendingDirectionStable() {
+    if (_pendingDirectionWindow.length < _turnDirectionConfirmationSamples) {
+      return false;
+    }
+    return _pendingDirectionWindow.every((d) => d == _pendingDirection);
+  }
+
+  void _resetPendingTurnCandidate() {
+    _pendingPivotAngle = null;
+    _pendingDirection = _MovementDirection.unknown;
+    _directionBeforePending = _MovementDirection.unknown;
+    _pendingDirectionWindow.clear();
   }
 
   void _onLocalMaximum(double angle) {
@@ -941,13 +1000,12 @@ class BleBloc extends Bloc<BleEvent, BleState> {
 
     // Full repetition is counted only after a valid minimum.
     if (!_sawLocalMinInCurrentRep) return;
-    if (angle < _maxAngle - _extremaTolerance) return;
 
     if (_currentRepTable.isNotEmpty) {
-      // When turn is confirmed at the top, the very first descending shift
-      // (typically starting near max angle) can already be in the current
-      // table. Move it to the next repetition so each rep starts from max.
-      final carryForNextRep = _extractTopBoundaryShift();
+      // While turn confirmation accumulates samples, several descending shifts
+      // can already be appended to current repetition. Move that tail so the
+      // saved repetition ends at the true local maximum.
+      final carryForNextRep = _extractTopBoundaryShifts();
 
       _repetitionTables.add(List<FinalSegment>.from(_currentRepTable));
       final repNumber = _repetitionTables.length;
@@ -956,8 +1014,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       _printRepetitionTable(repNumber, _currentRepTable);
       _currentRepTable.clear();
 
-      if (carryForNextRep != null) {
-        _currentRepTable.add(carryForNextRep);
+      if (carryForNextRep.isNotEmpty) {
+        _currentRepTable.addAll(carryForNextRep);
       }
     }
 
@@ -965,29 +1023,36 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _sawLocalMinInCurrentRep = false;
 
     if (_completedReps >= _targetReps) {
-      appTalker
-          .critical("Достигнуто $_targetReps повторений, завершение записи");
-      _isRecordingReference = false;
-      add(BleStopReferenceRecording());
+      appTalker.critical(
+          "Достигнуто $_targetReps повторений, ожидание следующего EMG пакета");
+      _awaitingTerminalEmgSample = true;
     }
   }
 
-  FinalSegment? _extractTopBoundaryShift() {
-    if (_currentRepTable.isEmpty) return null;
+  List<FinalSegment> _extractTopBoundaryShifts() {
+    if (_currentRepTable.isEmpty) return const [];
 
-    final last = _currentRepTable.last;
-    final isNearTop = last.firstAvgAngle >= (_maxAngle - _extremaTolerance);
-    if (!isNearTop) return null;
+    // Collect trailing descending shifts (added while waiting for turn
+    // confirmation) and carry them to the next repetition.
+    int splitIndex = _currentRepTable.length;
+    while (splitIndex > 0) {
+      final row = _currentRepTable[splitIndex - 1];
+      if (row.signedAngle < 0) {
+        splitIndex--;
+        continue;
+      }
+      break;
+    }
 
-    // Move boundary row to next repetition to avoid losing first top sample.
-    return _currentRepTable.removeLast();
+    if (splitIndex >= _currentRepTable.length) return const [];
+    final carry = List<FinalSegment>.from(_currentRepTable.sublist(splitIndex));
+    _currentRepTable.removeRange(splitIndex, _currentRepTable.length);
+    return carry;
   }
 
   void _onLocalMinimum(double angle) {
     appTalker.info("Локальный минимум: ${angle.toStringAsFixed(1)}°");
-    if (angle <= _minAngle + _extremaTolerance) {
-      _sawLocalMinInCurrentRep = true;
-    }
+    _sawLocalMinInCurrentRep = true;
   }
 
   void _printRepetitionTable(int repNumber, List<FinalSegment> repTable) {

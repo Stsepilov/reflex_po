@@ -10,7 +10,6 @@ class FinalSegment {
   final double
       absoluteAngle; // Absolute difference between last and first angle
   final double avgEmg; // Average EMG across the whole temp table
-  final double absoluteEmg; // Difference between last and first EMG
   final double deltaAngle; // (max - min) / 2 for angle
   final double deltaEmg; // (max - min) / 2 for EMG
   final int timeMs; // Time from last row - first row
@@ -22,7 +21,6 @@ class FinalSegment {
     required this.signedAngle,
     required this.absoluteAngle,
     required this.avgEmg,
-    required this.absoluteEmg,
     required this.deltaAngle,
     required this.deltaEmg,
     required this.timeMs,
@@ -35,7 +33,6 @@ class FinalSegment {
         'signedAngle': signedAngle,
         'absoluteAngle': absoluteAngle,
         'avgEmg': avgEmg,
-        'absoluteEmg': absoluteEmg,
         'deltaAngle': deltaAngle,
         'deltaEmg': deltaEmg,
         'timeMs': timeMs,
@@ -59,7 +56,6 @@ class FinalSegment {
       signedAngle: signedAngle,
       absoluteAngle: absoluteAngle,
       avgEmg: (json['avgEmg'] as num).toDouble(),
-      absoluteEmg: (json['absoluteEmg'] as num).toDouble(),
       deltaAngle: (json['deltaAngle'] as num).toDouble(),
       deltaEmg: (json['deltaEmg'] as num).toDouble(),
       timeMs: json['timeMs'] as int,
@@ -81,8 +77,6 @@ class FinalSegment {
     // Calculate absolute values (difference between last and first)
     final signedAngle = lastRow.avgAngle - firstRow.avgAngle;
     final absoluteAngle = signedAngle.abs();
-    final absoluteEmg = lastRow.avgEmg - firstRow.avgEmg;
-
     // Calculate delta values (max - min) / 2
     final angles = tempData.map((e) => e.avgAngle).toList();
     final emgs = tempData.map((e) => e.avgEmg).toList();
@@ -108,7 +102,6 @@ class FinalSegment {
       signedAngle: signedAngle,
       absoluteAngle: absoluteAngle,
       avgEmg: avgEmg,
-      absoluteEmg: absoluteEmg,
       deltaAngle: deltaAngle,
       deltaEmg: deltaEmg,
       timeMs: timeMs,
