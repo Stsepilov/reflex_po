@@ -17,6 +17,18 @@ import '../../models/final_segment.dart';
 
 enum _MovementDirection { unknown, up, down }
 
+enum _ExtremumType { minimum, maximum }
+
+class _RuntimeRepPoint {
+  final double angle;
+  final int status; // -1=unknown, 0=inactive, 1=active
+
+  const _RuntimeRepPoint({
+    required this.angle,
+    required this.status,
+  });
+}
+
 class BleBloc extends Bloc<BleEvent, BleState> {
   static const String _referenceTableKey = "reference_table";
   static const String _repetitionTablesKey = "reference_repetition_tables";
@@ -24,6 +36,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   static const int _phaseGridPoints = 101;
 
   late BleService _bleService;
+  bool _acceptIncomingData = true;
   // late TestDataGenerator _testDataGenerator;
 
   bool _isRecordingReference = false;
@@ -53,11 +66,21 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   static const double _emgEmaDtSeconds = 0.02;
   static const double _emgEmaTauUpSeconds = 0.08;
   static const double _emgEmaTauDownSeconds = 0.18;
+  static const double _referenceActivationThreshold = 0.2;
+  static const double _realtimeActivationKOn = 3.0;
+  static const double _realtimeActivationKOff = 1.8;
+  static const int _realtimeActivationSamplePoints = 3;
+  // Testing helper: randomize EMG amplitude when source values are too static.
+  static const bool _useRandomEmgMultiplierForTesting = true;
+  static const double _testEmgRandomMinMultiplier = 0.75;
+  static const double _testEmgRandomMaxMultiplier = 1.35;
+  static const double _runtimeExtremumEpsilon = 0.1;
 
-  // Repetition tracking (max -> min -> max)
+  // Repetition tracking (auto-detected start: max/min cycle)
   int _completedReps = 0;
   final int _targetReps = 10;
-  bool _sawLocalMinInCurrentRep = false;
+  _ExtremumType? _anchorExtremum;
+  bool _sawOppositeExtremumInCurrentRep = false;
   double? _previousAvgAngle;
   _MovementDirection _lastDirection = _MovementDirection.unknown;
 
@@ -95,15 +118,40 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   Timer? _comparisonTimer;
 
   // EMG baseline calibration
-  static const int _baselineCalibrationDurationMs = 3000;
+  static const int _baselineCalibrationDurationMs = 4000;
+  static const int _baselinePhaseDurationMs = 2000;
+  static const double _noiseScaleFactor = 1.4826;
   double _emgBaseline = 0.0;
+  double _emgNoise = 0.0;
   bool _isCollectingBaseline = false;
+  bool _isCollectingNoise = false;
   final List<double> _baselineSamples = [];
+  final List<double> _noiseDeviationSamples = [];
   Timer? _baselineTimer;
+  Timer? _baselinePhaseTimer;
+
+  // EMG activity comparison state (reference vs runtime)
+  List<int> _referenceMuscleStatus = [];
+  List<int> _currentRepMuscleStatus = [];
+  List<int> _previousRepMuscleStatus = [];
+  final List<_RuntimeRepPoint> _runtimeRepPoints = [];
+  int _runtimeRepWriteIndex = 0;
+  bool _runtimeRepStarted = false;
+  bool _runtimeMuscleActive = false;
+  int _runtimeActivationStreak = 0;
+  int _runtimeDeactivationStreak = 0;
+  double _currentRepEffortPercent = 0.0;
+  double _referenceMinEmg = 0.0;
+  double _referenceMaxEmg = 1.0;
+
+  _ExtremumType? _runtimeAnchorExtremum;
+  bool _runtimeSawOppositeExtremum = false;
+  final List<double> _runtimeAngleDetectionWindow = [];
 
   // Performance monitoring
   int _droppedFrames = 0;
   DateTime _lastProcessTime = DateTime.now();
+  final Random _random = Random();
 
   BleBloc() : super(BleState.initial()) {
     _bleService = BleService(
@@ -113,6 +161,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         required emgValues,
         required timeValues,
       }) {
+        if (!_acceptIncomingData) return;
         add(BleNewDataReceived(
           angleValues: angleValues,
           emgValues: emgValues,
@@ -160,6 +209,15 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     on<BleFinishBaselineCalibration>(_onFinishBaselineCalibration);
   }
 
+  // Used by UI screens that need to open modal interactions without BLE flood.
+  void suspendIncomingDataImmediately() {
+    _acceptIncomingData = false;
+  }
+
+  void resumeIncomingDataImmediately() {
+    _acceptIncomingData = true;
+  }
+
   Future<void> _onStartScan(BleStartScan event, Emitter<BleState> emit) async {
     emit(state.copyWith(status: BleConnectionStatus.scanning));
     _bleService.startScan();
@@ -179,12 +237,20 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _emgEmaValue = null;
     _latestAngle = 0.0;
     _emaAngle = null;
+    _referenceMuscleStatus = [];
+    _currentRepMuscleStatus = [];
+    _previousRepMuscleStatus = [];
+    _resetRuntimeComparisonTracking();
 
     emit(
       state.copyWith(
         values: [],
         emgValues: [],
         emgStartX: 0,
+        referenceMuscleStatus: [],
+        currentRepMuscleStatus: [],
+        previousRepMuscleStatus: [],
+        currentRepEffortPercent: 0.0,
         status: BleConnectionStatus.scanning,
       ),
     );
@@ -230,11 +296,29 @@ class BleBloc extends Bloc<BleEvent, BleState> {
 
     final adjustedPacketEmg = <double>[];
     if (event.emgValues.isNotEmpty) {
-      final packetEmg = event.emgValues;
+      final packetEmg = _useRandomEmgMultiplierForTesting
+          ? event.emgValues
+              .map((value) => value * _nextTestEmgMultiplier())
+              .toList(growable: false)
+          : event.emgValues;
       if (_isCollectingBaseline) {
-        _baselineSamples.addAll(packetEmg);
-      } else {
         for (final emgValue in packetEmg) {
+          if (_isCollectingNoise) {
+            final adjusted = _applyBaseline(emgValue);
+            final medianFiltered = _nextEmgMedian(adjusted);
+            if (medianFiltered == null) {
+              continue;
+            }
+            final emgNow = _updateEmgAttackReleaseEma(medianFiltered);
+            final deviation = (_emgBaseline - emgNow).abs();
+            _noiseDeviationSamples.add(deviation);
+          } else {
+            _baselineSamples.add(emgValue);
+          }
+        }
+      } else {
+        for (int i = 0; i < packetEmg.length; i++) {
+          final emgValue = packetEmg[i];
           final adjusted = _applyBaseline(emgValue);
           final medianFiltered = _nextEmgMedian(adjusted);
           if (medianFiltered == null) {
@@ -242,6 +326,14 @@ class BleBloc extends Bloc<BleEvent, BleState> {
           }
 
           final emaFiltered = _updateEmgAttackReleaseEma(medianFiltered);
+          final angleForSample = event.angleValues.isNotEmpty
+              ? _valueAtOrLast(event.angleValues, i)
+              : _latestAngle;
+
+          _processRealtimeEmgComparisonSample(
+            emgNow: emaFiltered,
+            currentAngle: angleForSample,
+          );
 
           adjustedPacketEmg.add(emaFiltered);
           _emgForUi.add(emaFiltered);
@@ -270,7 +362,18 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       values: List<double>.from(_anglesForUi),
       emgValues: List<double>.from(_emgForUi),
       emgStartX: emgStartX < 0 ? 0 : emgStartX,
+      referenceMuscleStatus: List<int>.from(_referenceMuscleStatus),
+      currentRepMuscleStatus: List<int>.from(_currentRepMuscleStatus),
+      previousRepMuscleStatus: List<int>.from(_previousRepMuscleStatus),
+      currentRepEffortPercent: _currentRepEffortPercent,
+      emgNoise: _emgNoise,
     ));
+  }
+
+  double _nextTestEmgMultiplier() {
+    final span = _testEmgRandomMaxMultiplier - _testEmgRandomMinMultiplier;
+    if (span <= 0) return 1.0;
+    return _testEmgRandomMinMultiplier + _random.nextDouble() * span;
   }
 
   double _adaptiveEmaAlpha(double rawAngle) {
@@ -317,13 +420,20 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     BleStartBaselineCalibration event,
     Emitter<BleState> emit,
   ) async {
+    _baselinePhaseTimer?.cancel();
     _baselineTimer?.cancel();
     _baselineSamples.clear();
+    _noiseDeviationSamples.clear();
     _emgMedianWindow.clear();
     _emgEmaValue = null;
     _isCollectingBaseline = true;
+    _isCollectingNoise = false;
     appTalker.info(
       "EMG baseline calibration started (${_baselineCalibrationDurationMs}ms)",
+    );
+    _baselinePhaseTimer = Timer(
+      const Duration(milliseconds: _baselinePhaseDurationMs),
+      _startNoiseCollectionPhase,
     );
     _baselineTimer = Timer(
       const Duration(milliseconds: _baselineCalibrationDurationMs),
@@ -339,22 +449,243 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     BleFinishBaselineCalibration event,
     Emitter<BleState> emit,
   ) async {
+    _baselinePhaseTimer?.cancel();
+    _baselinePhaseTimer = null;
     _baselineTimer?.cancel();
     _baselineTimer = null;
     _isCollectingBaseline = false;
 
-    if (_baselineSamples.isEmpty) {
+    if (_isCollectingNoise && _noiseDeviationSamples.isNotEmpty) {
+      final deviationMedian = _median(_noiseDeviationSamples);
+      _emgNoise = _noiseScaleFactor * deviationMedian;
+      appTalker.info(
+        "EMG calibration finished: baseline=$_emgBaseline, noise=$_emgNoise, deviations=${_noiseDeviationSamples.length}",
+      );
+    } else if (_baselineSamples.isEmpty) {
       appTalker.warning(
         "EMG baseline calibration finished without samples. Keep previous baseline=$_emgBaseline",
       );
+    } else {
+      _emgBaseline = _median(_baselineSamples);
+      appTalker.warning(
+        "EMG baseline calibration finished without noise samples. baseline=$_emgBaseline, keep previous noise=$_emgNoise",
+      );
+    }
+
+    _isCollectingNoise = false;
+    _baselineSamples.clear();
+    _noiseDeviationSamples.clear();
+    _emgMedianWindow.clear();
+    _emgEmaValue = null;
+    emit(state.copyWith(emgNoise: _emgNoise));
+  }
+
+  void _startNoiseCollectionPhase() {
+    if (!_isCollectingBaseline) return;
+    if (_baselineSamples.isEmpty) {
+      appTalker.warning(
+        "EMG baseline phase finished without samples. Keep previous baseline=$_emgBaseline",
+      );
+      _isCollectingNoise = true;
       return;
     }
 
     _emgBaseline = _median(_baselineSamples);
-    appTalker.info(
-      "EMG baseline calibration finished: baseline=$_emgBaseline, samples=${_baselineSamples.length}",
-    );
     _baselineSamples.clear();
+    _noiseDeviationSamples.clear();
+    _emgMedianWindow.clear();
+    _emgEmaValue = null;
+    _isCollectingNoise = true;
+
+    appTalker.info(
+      "EMG baseline phase finished: baseline=$_emgBaseline. Start noise collection (${_baselineCalibrationDurationMs - _baselinePhaseDurationMs}ms)",
+    );
+  }
+
+  void _prepareReferenceMuscleStatus() {
+    if (_phaseEmg.isEmpty || _phaseTheta.isEmpty) {
+      _referenceMuscleStatus = [];
+      _currentRepMuscleStatus = [];
+      _previousRepMuscleStatus = [];
+      _referenceMinEmg = 0.0;
+      _referenceMaxEmg = 1.0;
+      return;
+    }
+
+    _referenceMinEmg = _phaseEmg.reduce(min);
+    _referenceMaxEmg = _phaseEmg.reduce(max);
+    final emgRange = (_referenceMaxEmg - _referenceMinEmg).abs();
+    _referenceMuscleStatus = _phaseEmg.map((emg) {
+      final relative =
+          emgRange < 1e-9 ? 0.0 : (emg - _referenceMinEmg) / emgRange;
+      return relative > _referenceActivationThreshold ? 1 : 0;
+    }).toList();
+
+    _currentRepMuscleStatus =
+        List<int>.filled(_referenceMuscleStatus.length, -1);
+    _previousRepMuscleStatus =
+        List<int>.filled(_referenceMuscleStatus.length, -1);
+  }
+
+  void _resetRuntimeComparisonTracking() {
+    _runtimeRepPoints.clear();
+    _runtimeRepWriteIndex = 0;
+    _runtimeRepStarted = false;
+    _runtimeMuscleActive = false;
+    _runtimeActivationStreak = 0;
+    _runtimeDeactivationStreak = 0;
+    _currentRepEffortPercent = 0.0;
+    _runtimeAnchorExtremum = null;
+    _runtimeSawOppositeExtremum = false;
+    _runtimeAngleDetectionWindow.clear();
+
+    if (_referenceMuscleStatus.isNotEmpty) {
+      _currentRepMuscleStatus =
+          List<int>.filled(_referenceMuscleStatus.length, -1);
+      _previousRepMuscleStatus =
+          List<int>.filled(_referenceMuscleStatus.length, -1);
+    } else {
+      _currentRepMuscleStatus = [];
+      _previousRepMuscleStatus = [];
+    }
+  }
+
+  void _processRealtimeEmgComparisonSample({
+    required double emgNow,
+    required double currentAngle,
+  }) {
+    if (!_isComparing || _referenceMuscleStatus.isEmpty) return;
+
+    final maxRefEmg = _referenceMaxEmg <= 0 ? 1.0 : _referenceMaxEmg;
+    _currentRepEffortPercent = (emgNow / maxRefEmg * 100).clamp(0.0, 999.0);
+
+    final isMuscleActive = _updateRuntimeMuscleState(emgNow);
+    _processRuntimeRepPoint(
+        currentAngle: currentAngle, isMuscleActive: isMuscleActive);
+    if (_runtimeRepStarted) {
+      _detectRuntimeExtrema(currentAngle);
+    }
+  }
+
+  bool _updateRuntimeMuscleState(double emgNow) {
+    final noiseBase = _emgNoise <= 1e-9 ? 1.0 : _emgNoise;
+    final onThreshold = _realtimeActivationKOn * noiseBase;
+    final offThreshold = _realtimeActivationKOff * noiseBase;
+
+    if (!_runtimeMuscleActive) {
+      if (emgNow >= onThreshold) {
+        _runtimeActivationStreak++;
+      } else {
+        _runtimeActivationStreak = 0;
+      }
+      _runtimeDeactivationStreak = 0;
+      if (_runtimeActivationStreak >= _realtimeActivationSamplePoints) {
+        _runtimeMuscleActive = true;
+        _runtimeActivationStreak = 0;
+      }
+      return _runtimeMuscleActive;
+    }
+
+    if (emgNow <= offThreshold) {
+      _runtimeDeactivationStreak++;
+    } else {
+      _runtimeDeactivationStreak = 0;
+    }
+    _runtimeActivationStreak = 0;
+    if (_runtimeDeactivationStreak >= _realtimeActivationSamplePoints) {
+      _runtimeMuscleActive = false;
+      _runtimeDeactivationStreak = 0;
+    }
+    return _runtimeMuscleActive;
+  }
+
+  void _processRuntimeRepPoint({
+    required double currentAngle,
+    required bool isMuscleActive,
+  }) {
+    if (!_runtimeRepStarted) {
+      _runtimeRepStarted = true;
+      _runtimeRepPoints.clear();
+      _runtimeRepWriteIndex = 0;
+      // Start extrema detection from scratch for this repetition only.
+      _runtimeAnchorExtremum = null;
+      _runtimeSawOppositeExtremum = false;
+      _runtimeAngleDetectionWindow.clear();
+      _currentRepMuscleStatus =
+          List<int>.filled(_referenceMuscleStatus.length, -1);
+    }
+
+    final status = isMuscleActive ? 1 : 0;
+    _runtimeRepPoints
+        .add(_RuntimeRepPoint(angle: currentAngle, status: status));
+    if (_currentRepMuscleStatus.isEmpty) return;
+    if (_runtimeRepWriteIndex < _currentRepMuscleStatus.length) {
+      _currentRepMuscleStatus[_runtimeRepWriteIndex] = status;
+      _runtimeRepWriteIndex++;
+      return;
+    }
+    // If incoming stream is longer than reference grid, keep updating tail cell.
+    _currentRepMuscleStatus[_currentRepMuscleStatus.length - 1] = status;
+  }
+
+  void _detectRuntimeExtrema(double currentAngle) {
+    _runtimeAngleDetectionWindow.add(currentAngle);
+    if (_runtimeAngleDetectionWindow.length < 4) {
+      return;
+    }
+    if (_runtimeAngleDetectionWindow.length > 4) {
+      _runtimeAngleDetectionWindow.removeAt(0);
+    }
+
+    // For exercise runtime only:
+    // candidate extremum is confirmed by the next 2 angle samples.
+    final prev = _runtimeAngleDetectionWindow[0];
+    final candidate = _runtimeAngleDetectionWindow[1];
+    final next1 = _runtimeAngleDetectionWindow[2];
+    final next2 = _runtimeAngleDetectionWindow[3];
+
+    final isMaximum = (candidate - prev) > _runtimeExtremumEpsilon &&
+        (candidate - next1) > _runtimeExtremumEpsilon &&
+        (candidate - next2) > _runtimeExtremumEpsilon;
+    if (isMaximum) {
+      _onRuntimeExtremumDetected(_ExtremumType.maximum);
+      return;
+    }
+
+    final isMinimum = (prev - candidate) > _runtimeExtremumEpsilon &&
+        (next1 - candidate) > _runtimeExtremumEpsilon &&
+        (next2 - candidate) > _runtimeExtremumEpsilon;
+    if (isMinimum) {
+      _onRuntimeExtremumDetected(_ExtremumType.minimum);
+    }
+  }
+
+  void _onRuntimeExtremumDetected(_ExtremumType currentExtremum) {
+    if (_runtimeAnchorExtremum == null) {
+      _runtimeAnchorExtremum = currentExtremum;
+      _runtimeSawOppositeExtremum = false;
+      return;
+    }
+
+    if (currentExtremum != _runtimeAnchorExtremum) {
+      _runtimeSawOppositeExtremum = true;
+      return;
+    }
+
+    if (!_runtimeSawOppositeExtremum) return;
+
+    if (_runtimeRepStarted && _currentRepMuscleStatus.isNotEmpty) {
+      _previousRepMuscleStatus = List<int>.from(_currentRepMuscleStatus);
+    }
+
+    _runtimeRepPoints.clear();
+    _runtimeRepWriteIndex = 0;
+    _currentRepMuscleStatus =
+        List<int>.filled(_referenceMuscleStatus.length, -1);
+    _runtimeRepStarted = false;
+    _runtimeAnchorExtremum = null;
+    _runtimeSawOppositeExtremum = false;
+    _runtimeAngleDetectionWindow.clear();
   }
 
   Future<void> _onStartReference(
@@ -366,7 +697,8 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _tempDataIndex = 0;
     _shiftDataIndex = 0;
     _completedReps = 0;
-    _sawLocalMinInCurrentRep = false;
+    _anchorExtremum = _ExtremumType.maximum;
+    _sawOppositeExtremumInCurrentRep = false;
     _previousAvgAngle = null;
     _lastDirection = _MovementDirection.unknown;
     _pendingPivotAngle = null;
@@ -383,7 +715,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     _terminalEmgFromNextPacket = null;
 
     appTalker.info(
-        "Эталон: старт записи ($_targetReps повторений, $_maxAngle° → $_minAngle° → $_maxAngle°)");
+        "Эталон: старт записи ($_targetReps повторений, диапазон $_minAngle°-$_maxAngle°, фиксированный цикл max->min->max)");
     emit(state.copyWith(isRecordingReference: true));
   }
 
@@ -997,47 +1329,20 @@ class BleBloc extends Bloc<BleEvent, BleState> {
 
   void _onLocalMaximum(double angle) {
     appTalker.info("Локальный максимум: ${angle.toStringAsFixed(1)}°");
-
-    // Full repetition is counted only after a valid minimum.
-    if (!_sawLocalMinInCurrentRep) return;
-
-    if (_currentRepTable.isNotEmpty) {
-      // While turn confirmation accumulates samples, several descending shifts
-      // can already be appended to current repetition. Move that tail so the
-      // saved repetition ends at the true local maximum.
-      final carryForNextRep = _extractTopBoundaryShifts();
-
-      _repetitionTables.add(List<FinalSegment>.from(_currentRepTable));
-      final repNumber = _repetitionTables.length;
-      appTalker.info(
-          "Максимум #$repNumber подтверждён. Повтор #$repNumber сохранён (${_currentRepTable.length} строк)");
-      _printRepetitionTable(repNumber, _currentRepTable);
-      _currentRepTable.clear();
-
-      if (carryForNextRep.isNotEmpty) {
-        _currentRepTable.addAll(carryForNextRep);
-      }
-    }
-
-    _completedReps = _repetitionTables.length;
-    _sawLocalMinInCurrentRep = false;
-
-    if (_completedReps >= _targetReps) {
-      appTalker.critical(
-          "Достигнуто $_targetReps повторений, ожидание следующего EMG пакета");
-      _awaitingTerminalEmgSample = true;
-    }
+    _onExtremumDetected(_ExtremumType.maximum);
   }
 
-  List<FinalSegment> _extractTopBoundaryShifts() {
+  List<FinalSegment> _extractBoundaryShifts(_ExtremumType closingExtremum) {
     if (_currentRepTable.isEmpty) return const [];
 
-    // Collect trailing descending shifts (added while waiting for turn
-    // confirmation) and carry them to the next repetition.
+    // While turn confirmation accumulates samples, trailing shifts of the
+    // next half-cycle can already be appended to the current repetition.
+    // Carry them to the next repetition based on the closing extremum.
+    final carrySign = closingExtremum == _ExtremumType.maximum ? -1.0 : 1.0;
     int splitIndex = _currentRepTable.length;
     while (splitIndex > 0) {
       final row = _currentRepTable[splitIndex - 1];
-      if (row.signedAngle < 0) {
+      if (row.signedAngle * carrySign > 0) {
         splitIndex--;
         continue;
       }
@@ -1052,7 +1357,50 @@ class BleBloc extends Bloc<BleEvent, BleState> {
 
   void _onLocalMinimum(double angle) {
     appTalker.info("Локальный минимум: ${angle.toStringAsFixed(1)}°");
-    _sawLocalMinInCurrentRep = true;
+    _onExtremumDetected(_ExtremumType.minimum);
+  }
+
+  void _onExtremumDetected(_ExtremumType currentExtremum) {
+    if (_anchorExtremum == null) {
+      _anchorExtremum = currentExtremum;
+      _sawOppositeExtremumInCurrentRep = false;
+      appTalker.info(
+          "Установлен стартовый экстремум: ${currentExtremum == _ExtremumType.maximum ? "максимум" : "минимум"}");
+      return;
+    }
+
+    if (currentExtremum != _anchorExtremum) {
+      _sawOppositeExtremumInCurrentRep = true;
+      return;
+    }
+
+    // Count repetition only when the cycle is closed:
+    // anchor -> opposite -> anchor.
+    if (!_sawOppositeExtremumInCurrentRep) return;
+
+    if (_currentRepTable.isNotEmpty) {
+      final carryForNextRep = _extractBoundaryShifts(currentExtremum);
+
+      _repetitionTables.add(List<FinalSegment>.from(_currentRepTable));
+      final repNumber = _repetitionTables.length;
+      appTalker.info(
+          "Экстремум #$repNumber подтверждён. Повтор #$repNumber сохранён (${_currentRepTable.length} строк)");
+      _printRepetitionTable(repNumber, _currentRepTable);
+      _currentRepTable.clear();
+
+      if (carryForNextRep.isNotEmpty) {
+        _currentRepTable.addAll(carryForNextRep);
+      }
+    }
+
+    _completedReps = _repetitionTables.length;
+    _sawOppositeExtremumInCurrentRep = false;
+
+    if (_completedReps >= _targetReps) {
+      appTalker.critical(
+          "Достигнуто $_targetReps повторений, ожидание следующего EMG пакета");
+      _awaitingTerminalEmgSample = true;
+    }
   }
 
   void _printRepetitionTable(int repNumber, List<FinalSegment> repTable) {
@@ -1180,6 +1528,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       }
 
       appTalker.info("ETALON DATA LOAD COMPLETED");
+      _prepareReferenceMuscleStatus();
 
       // ОБНОВЛЯЕМ STATE
       emit(
@@ -1187,6 +1536,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
           minAngleBorder: minAngle,
           maxAngleBorder: maxAngle,
           referenceSegments: List.from(_referenceSegments),
+          referenceMuscleStatus: List<int>.from(_referenceMuscleStatus),
+          currentRepMuscleStatus: List<int>.from(_currentRepMuscleStatus),
+          previousRepMuscleStatus: List<int>.from(_previousRepMuscleStatus),
+          currentRepEffortPercent: 0.0,
         ),
       );
     } catch (e) {
@@ -1255,6 +1608,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         emg: emg.toList(),
         time: time.toList(),
       );
+      _phasePhi = phi.toList();
+      _phaseTheta = theta.toList();
+      _phaseEmg = emg.toList();
+      _phaseTime = time.toList();
       appTalker.info("PHASE PROFILE LOAD COMPLETED");
     } catch (e) {
       appTalker.error("ERROR LOADING PHASE PROFILE", e);
@@ -1284,6 +1641,9 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       return;
     }
 
+    _prepareReferenceMuscleStatus();
+    _resetRuntimeComparisonTracking();
+
     _isComparing = true;
     _comparisonStartTime = DateTime.now();
     _comparisonTimer?.cancel();
@@ -1299,6 +1659,11 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       elapsedTimeMs: 0,
       currentReferenceAngle: 0.0,
       angleDifference: 0.0,
+      referenceMuscleStatus: List<int>.from(_referenceMuscleStatus),
+      currentRepMuscleStatus: List<int>.from(_currentRepMuscleStatus),
+      previousRepMuscleStatus: List<int>.from(_previousRepMuscleStatus),
+      currentRepEffortPercent: _currentRepEffortPercent,
+      emgNoise: _emgNoise,
     ));
   }
 
@@ -1308,8 +1673,14 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   ) async {
     _isComparing = false;
     _comparisonTimer?.cancel();
+    _resetRuntimeComparisonTracking();
 
-    emit(state.copyWith(isComparing: false));
+    emit(state.copyWith(
+      isComparing: false,
+      currentRepMuscleStatus: List<int>.from(_currentRepMuscleStatus),
+      previousRepMuscleStatus: List<int>.from(_previousRepMuscleStatus),
+      currentRepEffortPercent: _currentRepEffortPercent,
+    ));
   }
 
   Future<void> _onResetComparison(
@@ -1394,6 +1765,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     Emitter<BleState> emit,
   ) async {
     appTalker.info("Запуск потока данных");
+    _acceptIncomingData = true;
     await _bleService.resumeDataStream();
     // _testDataGenerator.start();
   }
@@ -1403,8 +1775,10 @@ class BleBloc extends Bloc<BleEvent, BleState> {
     Emitter<BleState> emit,
   ) async {
     appTalker.info("Остановка потока данных");
+    _acceptIncomingData = false;
     _emgMedianWindow.clear();
     _emgEmaValue = null;
+    _resetRuntimeComparisonTracking();
     _bleService.pauseDataStream();
     // _testDataGenerator.stop();
   }
@@ -1417,11 +1791,13 @@ class BleBloc extends Bloc<BleEvent, BleState> {
         "Обновление границ углов: ${event.minAngle}° - ${event.maxAngle}°");
     _minAngle = event.minAngle;
     _maxAngle = event.maxAngle;
-    await _saveAngleBordersToStorage(event.minAngle, event.maxAngle);
     emit(state.copyWith(
       minAngleBorder: event.minAngle,
       maxAngleBorder: event.maxAngle,
     ));
+    unawaited(
+      _saveAngleBordersToStorage(event.minAngle, event.maxAngle),
+    );
   }
 
   Future<void> _saveAngleBordersToStorage(int minAngle, int maxAngle) async {
@@ -1433,6 +1809,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   @override
   Future<void> close() async {
     _comparisonTimer?.cancel();
+    _baselinePhaseTimer?.cancel();
     _baselineTimer?.cancel();
     _bleService.dispose();
     // _testDataGenerator.dispose();

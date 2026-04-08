@@ -46,14 +46,14 @@ class _RecordEtalonScreenState extends State<RecordEtalonScreen> {
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
-        Future.delayed(const Duration(seconds: 3), () {
+        Future.delayed(const Duration(seconds: 4), () {
           if (Navigator.of(dialogContext).canPop()) {
             Navigator.of(dialogContext).pop();
           }
         });
         return AlertDialog(
           title: const Text('Калибровка EMG'),
-          content: const Text('Пожалуйста, держите руку в покое 3 секунды.'),
+          content: const Text('Пожалуйста, держите руку в покое 4 секунды.'),
         );
       },
     );

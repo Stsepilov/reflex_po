@@ -19,6 +19,7 @@ class ExerciseScreen extends StatefulWidget {
 class _ExerciseScreenState extends State<ExerciseScreen> {
   BleBloc? _bleBloc;
   bool _isBaselineDialogActive = false;
+  bool _showEmgComparison = false;
 
   @override
   void didChangeDependencies() {
@@ -46,14 +47,17 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
-        Future.delayed(const Duration(seconds: 3), () {
+        Future.delayed(const Duration(seconds: 4), () {
           if (Navigator.of(dialogContext).canPop()) {
             Navigator.of(dialogContext).pop();
           }
         });
         return AlertDialog(
           title: const Text('Калибровка EMG'),
-          content: const Text('Пожалуйста, держите руку в покое 3 секунды.'),
+          content: const Text(
+            'Пожалуйста, держите руку в покое 4 секунды.\n'
+            'Первые 2 секунды: baseline, следующие 2 секунды: оценка шума.',
+          ),
         );
       },
     );
@@ -129,6 +133,117 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
               color: isError ? themeExt.accentColor : themeExt.primaryColor,
               fontSize: 13,
               fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmgStatusRow({
+    required String label,
+    required List<int> statuses,
+    required AppThemeExtension themeExt,
+    String? trailingText,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          SizedBox(
+            width: 58,
+            child: Text(
+              label,
+              style: TextStyle(
+                color: themeExt.textSecondaryColor,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Container(
+              height: 50,
+              decoration: BoxDecoration(
+                border: Border.all(
+                    color: themeExt.textSecondaryColor.withOpacity(0.18)),
+                borderRadius: BorderRadius.circular(8),
+                color: Colors.white.withOpacity(0.6),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: _EmgStatusStrip(
+                statuses: statuses,
+                activeColor: Colors.green.shade300,
+                inactiveColor: Colors.red.shade200,
+                unknownColor: Colors.white,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 78,
+            child: Text(
+              trailingText ?? '',
+              textAlign: TextAlign.right,
+              style: TextStyle(
+                color: themeExt.textPrimaryColor,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmgComparisonPanel(BleState state, AppThemeExtension themeExt) {
+    final referenceStatus = state.referenceMuscleStatus;
+    final currentStatus = state.currentRepMuscleStatus;
+    final previousStatus = state.previousRepMuscleStatus;
+    final effortPercent = state.currentRepEffortPercent;
+
+    if (referenceStatus.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.all(12),
+        child: Text(
+          'Для сравнения EMG сначала запишите эталон.',
+          style: TextStyle(color: themeExt.textSecondaryColor),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: Column(
+        children: [
+          _buildEmgStatusRow(
+            label: 'Эталон',
+            statuses: referenceStatus,
+            themeExt: themeExt,
+          ),
+          _buildEmgStatusRow(
+            label: 'Текущее',
+            statuses: currentStatus,
+            themeExt: themeExt,
+            trailingText: '${effortPercent.toStringAsFixed(0)}%',
+          ),
+          _buildEmgStatusRow(
+            label: 'Прошлый',
+            statuses: previousStatus,
+            themeExt: themeExt,
+          ),
+          Padding(
+            padding: const EdgeInsets.only(top: 2, right: 16),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                'Усилие = EMG / max EMG эталона',
+                style: TextStyle(
+                  color: themeExt.textSecondaryColor,
+                  fontSize: 11,
+                ),
+              ),
             ),
           ),
         ],
@@ -229,10 +344,34 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
 
             return Column(
               children: [
-                PulseChart(
-                  values: emgValues,
-                  xStart: state.emgStartX,
+                Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: SwitchListTile(
+                          dense: true,
+                          contentPadding:
+                              const EdgeInsets.symmetric(horizontal: 8),
+                          title: const Text('Сравнение EMG'),
+                          value: _showEmgComparison,
+                          onChanged: (value) {
+                            setState(() => _showEmgComparison = value);
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
+
+                if (_showEmgComparison)
+                  _buildEmgComparisonPanel(state, themeExt)
+                else
+                  PulseChart(
+                    values: emgValues,
+                    xStart: state.emgStartX,
+                  ),
 
                 const SizedBox(height: 5),
 
@@ -264,5 +403,122 @@ class _ExerciseScreenState extends State<ExerciseScreen> {
         ),
       ),
     );
+  }
+}
+
+class _EmgStatusStrip extends StatelessWidget {
+  final List<int> statuses;
+  final Color activeColor;
+  final Color inactiveColor;
+  final Color unknownColor;
+
+  const _EmgStatusStrip({
+    required this.statuses,
+    required this.activeColor,
+    required this.inactiveColor,
+    required this.unknownColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 50,
+      width: double.infinity,
+      child: CustomPaint(
+        painter: _EmgStatusStripPainter(
+          statuses: statuses,
+          activeColor: activeColor,
+          inactiveColor: inactiveColor,
+          unknownColor: unknownColor,
+        ),
+      ),
+    );
+  }
+}
+
+class _EmgStatusStripPainter extends CustomPainter {
+  final List<int> statuses;
+  final Color activeColor;
+  final Color inactiveColor;
+  final Color unknownColor;
+
+  _EmgStatusStripPainter({
+    required this.statuses,
+    required this.activeColor,
+    required this.inactiveColor,
+    required this.unknownColor,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (statuses.isEmpty) {
+      final p = Paint()..color = unknownColor;
+      canvas.drawRect(Offset.zero & size, p);
+      return;
+    }
+
+    final widthPx = size.width.floor().clamp(1, 1000000);
+    final rawValues = List<double?>.filled(widthPx, null);
+
+    double? valueAt(int index) {
+      if (index < 0 || index >= statuses.length) return null;
+      final status = statuses[index];
+      if (status < 0) return null;
+      return status == 1 ? 1.0 : 0.0;
+    }
+
+    for (int x = 0; x < widthPx; x++) {
+      final t = widthPx == 1 ? 0.0 : x / (widthPx - 1);
+      final position = t * (statuses.length - 1);
+      final left = position.floor();
+      final right = position.ceil();
+      final frac = position - left;
+      final leftValue = valueAt(left);
+      final rightValue = valueAt(right);
+
+      if (leftValue == null && rightValue == null) {
+        rawValues[x] = null;
+      } else if (leftValue == null) {
+        rawValues[x] = rightValue;
+      } else if (rightValue == null) {
+        rawValues[x] = leftValue;
+      } else {
+        rawValues[x] = leftValue + (rightValue - leftValue) * frac;
+      }
+    }
+
+    // Small spatial smoothing removes hard rectangular borders.
+    final smoothedValues = List<double?>.filled(widthPx, null);
+    const smoothRadius = 3;
+    for (int x = 0; x < widthPx; x++) {
+      double sum = 0.0;
+      int count = 0;
+      for (int k = -smoothRadius; k <= smoothRadius; k++) {
+        final idx = x + k;
+        if (idx < 0 || idx >= widthPx) continue;
+        final v = rawValues[idx];
+        if (v == null) continue;
+        sum += v;
+        count++;
+      }
+      smoothedValues[x] = count == 0 ? null : sum / count;
+    }
+
+    final paint = Paint()..isAntiAlias = true;
+    for (int x = 0; x < widthPx; x++) {
+      final v = smoothedValues[x];
+      paint.color = v == null
+          ? unknownColor
+          : Color.lerp(inactiveColor, activeColor, v.clamp(0.0, 1.0))!;
+      canvas.drawRect(Rect.fromLTWH(x.toDouble(), 0, 1.2, size.height), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _EmgStatusStripPainter oldDelegate) {
+    return oldDelegate.statuses != statuses ||
+        oldDelegate.activeColor != activeColor ||
+        oldDelegate.inactiveColor != inactiveColor ||
+        oldDelegate.unknownColor != unknownColor;
   }
 }

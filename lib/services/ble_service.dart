@@ -63,7 +63,8 @@ class BleService {
 
     // Подписка на результаты
     _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
-      appTalker.debug("BLE: получено ${results.length} результатов сканирования");
+      appTalker
+          .debug("BLE: получено ${results.length} результатов сканирования");
       for (ScanResult result in results) {
         if (result.device.platformName == targetDeviceName) {
           appTalker.info("BLE: найден девайс ${result.device.platformName}");
@@ -144,8 +145,8 @@ class BleService {
 
           final str = utf8.decode(value, allowMalformed: true).trim();
           if (str.isEmpty) return;
+          print("BLE RAW: $str");
 
-          appTalker.debug("BLE notify: $str");
           _handleIncomingData(str);
         },
         onError: (error) {

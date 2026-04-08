@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:go_router/go_router.dart';
 import '../themes/theme_extensions.dart';
 import '../blocs/ble/ble_bloc.dart';
 import '../blocs/ble/ble_event.dart';
 import '../blocs/ble/ble_state.dart';
+import '../navigation/app_router.dart';
 import '../widgets/no_etalon_dialog.dart';
 import '../widgets/angle_range_dialog.dart';
-import 'exercise_screen.dart';
-import 'record_etalon_screen.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -64,51 +64,51 @@ class _HomePageState extends State<HomePage> {
               ),
             ],
           ),
-        child: Row(
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: color.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(15),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: Icon(
+                  icon,
+                  size: 40,
+                  color: color,
+                ),
               ),
-              child: Icon(
-                icon,
-                size: 40,
+              const SizedBox(width: 20),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: themeExt.textPrimaryColor,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: themeExt.textSecondaryColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                Icons.arrow_forward_ios,
                 color: color,
+                size: 24,
               ),
-            ),
-            const SizedBox(width: 20),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: themeExt.textPrimaryColor,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    subtitle,
-                    style: TextStyle(
-                      fontSize: 14,
-                      color: themeExt.textSecondaryColor,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            Icon(
-              Icons.arrow_forward_ios,
-              color: color,
-              size: 24,
-            ),
-          ],
-        ),
+            ],
+          ),
         ),
       ),
     );
@@ -149,11 +149,11 @@ class _HomePageState extends State<HomePage> {
                     );
                     if (result != null) {
                       context.read<BleBloc>().add(
-                        BleUpdateAngleBorders(
-                          minAngle: result['minAngle']!,
-                          maxAngle: result['maxAngle']!,
-                        ),
-                      );
+                            BleUpdateAngleBorders(
+                              minAngle: result['minAngle']!,
+                              maxAngle: result['maxAngle']!,
+                            ),
+                          );
                     }
                   },
                 );
@@ -230,12 +230,12 @@ class _HomePageState extends State<HomePage> {
               BlocBuilder<BleBloc, BleState>(
                 builder: (context, state) {
                   final hasEtalon = state.referenceSegments.isNotEmpty;
-                  
+
                   return _buildNavigationCard(
                     context: context,
                     title: 'Начать упражнение',
-                    subtitle: hasEtalon 
-                        ? 'Тренировка с эталоном' 
+                    subtitle: hasEtalon
+                        ? 'Тренировка с эталоном'
                         : 'Требуется запись эталона',
                     icon: Icons.fitness_center,
                     color: themeExt.primaryColor,
@@ -245,15 +245,32 @@ class _HomePageState extends State<HomePage> {
                         // Show dialog if no etalon
                         await showNoEtalonDialog(context);
                       } else {
-                        // Navigate to exercise screen
-                        Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (newContext) => BlocProvider.value(
-                              value: context.read<BleBloc>(),
-                              child: const ExerciseScreen(),
-                            ),
-                          ),
-                        );
+                        context.push(AppRoutes.exercise);
+                      }
+                    },
+                  );
+                },
+              ),
+
+              // Limited-angle exercise card
+              BlocBuilder<BleBloc, BleState>(
+                builder: (context, state) {
+                  final hasEtalon = state.referenceSegments.isNotEmpty;
+
+                  return _buildNavigationCard(
+                    context: context,
+                    title: 'Упражнение в ограниченном угле',
+                    subtitle: hasEtalon
+                        ? 'Режим с ручной настройкой min/max'
+                        : 'Требуется запись эталона',
+                    icon: Icons.elderly,
+                    color: themeExt.primaryColor,
+                    isDisabled: !hasEtalon,
+                    onTap: () async {
+                      if (!hasEtalon) {
+                        await showNoEtalonDialog(context);
+                      } else {
+                        context.push(AppRoutes.seniorExercise);
                       }
                     },
                   );
@@ -268,14 +285,7 @@ class _HomePageState extends State<HomePage> {
                 icon: Icons.fiber_manual_record,
                 color: themeExt.accentColor,
                 onTap: () {
-                  Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (newContext) => BlocProvider.value(
-                        value: context.read<BleBloc>(),
-                        child: const RecordEtalonScreen(),
-                      ),
-                    ),
-                  );
+                  context.push(AppRoutes.recordEtalon);
                 },
               ),
 
