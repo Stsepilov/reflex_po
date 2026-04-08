@@ -70,10 +70,6 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   static const double _realtimeActivationKOn = 3.0;
   static const double _realtimeActivationKOff = 1.8;
   static const int _realtimeActivationSamplePoints = 3;
-  // Testing helper: randomize EMG amplitude when source values are too static.
-  static const bool _useRandomEmgMultiplierForTesting = true;
-  static const double _testEmgRandomMinMultiplier = 0.75;
-  static const double _testEmgRandomMaxMultiplier = 1.35;
   static const double _runtimeExtremumEpsilon = 0.1;
 
   // Repetition tracking (auto-detected start: max/min cycle)
@@ -151,7 +147,6 @@ class BleBloc extends Bloc<BleEvent, BleState> {
   // Performance monitoring
   int _droppedFrames = 0;
   DateTime _lastProcessTime = DateTime.now();
-  final Random _random = Random();
 
   BleBloc() : super(BleState.initial()) {
     _bleService = BleService(
@@ -296,11 +291,7 @@ class BleBloc extends Bloc<BleEvent, BleState> {
 
     final adjustedPacketEmg = <double>[];
     if (event.emgValues.isNotEmpty) {
-      final packetEmg = _useRandomEmgMultiplierForTesting
-          ? event.emgValues
-              .map((value) => value * _nextTestEmgMultiplier())
-              .toList(growable: false)
-          : event.emgValues;
+      final packetEmg = event.emgValues;
       if (_isCollectingBaseline) {
         for (final emgValue in packetEmg) {
           if (_isCollectingNoise) {
@@ -368,12 +359,6 @@ class BleBloc extends Bloc<BleEvent, BleState> {
       currentRepEffortPercent: _currentRepEffortPercent,
       emgNoise: _emgNoise,
     ));
-  }
-
-  double _nextTestEmgMultiplier() {
-    final span = _testEmgRandomMaxMultiplier - _testEmgRandomMinMultiplier;
-    if (span <= 0) return 1.0;
-    return _testEmgRandomMinMultiplier + _random.nextDouble() * span;
   }
 
   double _adaptiveEmaAlpha(double rawAngle) {
